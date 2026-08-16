@@ -44,48 +44,7 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
-def _mtp_quant_config(quant_config):
-    """The quantization the MTP module itself is built with.
-
-    The MTP module often ships unquantized even though the target checkpoint is
-    quantized; the loader's fusion gate has to see the same normalization the
-    constructor applies, or it would answer for the target's quantization.
-    """
-    # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
-    # BF16. Disable quantization for those checkpoints; non-serialized
-    # modelopt_fp4 still converts MoE expert weights on load.
-    if quant_config and (
-        quant_config.get_name() == "modelopt_mixed"
-        or (
-            quant_config.get_name() == "modelopt_fp4"
-            and quant_config.is_checkpoint_nvfp4_serialized
-        )
-    ):
-        return None
-    if is_npu() and get_spec().speculative_draft_model_quantization is None:
-        return None
-    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
-    # every `mtp.*` layer appears under the quantization exclude list. Detect
-    # that and skip quantization here so linear/MoE weight loaders allocate
-    # bf16 shapes (see sgl-project/sglang#23113).
-    if quant_config and quant_config.get_name() == "quark":
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            isinstance(layer, str) and layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
-            return None
-    return quant_config
-
-
 class Qwen3_5ForCausalLMMTP(nn.Module):
-
-    @staticmethod
-    def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
-            getattr(hf_config, "text_config", hf_config),
-            _mtp_quant_config(quant_config),
-        )
 
     def __init__(
         self,
@@ -102,10 +61,54 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        quant_config = _mtp_quant_config(quant_config)
+        # Keep the target quant config around.  ModelOpt embedded MTP body
+        # weights are BF16, but a TP1 sidecar can still use the checkpoint's
+        # native quantized lm_head instead of allocating a full BF16 head.
+        original_quant_config = quant_config
+
+        # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
+        # BF16. Disable quantization for those checkpoints; non-serialized
+        # modelopt_fp4 still converts MoE expert weights on load.
+        if quant_config and (
+            quant_config.get_name() == "modelopt_mixed"
+            or (
+                quant_config.get_name() == "modelopt_fp4"
+                and quant_config.is_checkpoint_nvfp4_serialized
+            )
+        ):
+            quant_config = None
+        if is_npu() and get_spec().speculative_draft_model_quantization is None:
+            quant_config = None
+
+        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
+        # bf16; every `mtp.*` layer appears under the quantization exclude
+        # list. Detect that and skip quantization here so linear/MoE weight
+        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
+        if quant_config and quant_config.get_name() == "quark":
+            exclude_layers = getattr(quant_config, "exclude_layers", [])
+            if any(
+                isinstance(layer, str) and layer.startswith("mtp.")
+                for layer in exclude_layers
+            ):
+                quant_config = None
 
         self.config = config
         self.tp_size = get_parallel().tp_size
+
+        # When ModelOpt quantization was disabled only for the embedded MTP
+        # body and this worker is TP1, keep a self-contained full embedding and
+        # a checkpoint-native quantized lm_head on the sidecar GPU.
+        self._load_full_embed_head = (
+            self.tp_size == 1
+            and original_quant_config is not None
+            and quant_config is None
+        )
+        self._lm_head_quant_config = (
+            original_quant_config
+            if self._load_full_embed_head
+            else quant_config
+        )
+
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
@@ -132,7 +135,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 self.lm_head = ParallelLMHead(
                     config.vocab_size,
                     config.hidden_size,
-                    quant_config=quant_config,
+                    quant_config=self._lm_head_quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
 
@@ -151,12 +154,16 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
+        # Under prefill-side pipeline parallelism the target's embed lives on the
+        # first stage and its lm_head on the last, so only one of them reaches a
+        # draft that sits on the last stage. Keep whatever the draft loaded itself
+        # for the half the target cannot share.
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
+        if head is not None and not self.config.tie_word_embeddings:
             del self.lm_head.weight
-
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -211,6 +218,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             if not forward_batch.forward_mode.is_idle():
                 input_embeds = self.pre_fc_norm_embedding(input_embeds)
                 hidden_states = self.pre_fc_norm_hidden(hidden_states)
+            # A captured prefill graph hands the model its static token slot, so
+            # input_embeds is the padded height while the target's hidden states
+            # arrive at this chunk's real height. Place the real rows into a slot
+            # of the same height; the padding rows are never read downstream.
+            if hidden_states.shape[0] != input_embeds.shape[0]:
+                rows = min(hidden_states.shape[0], input_embeds.shape[0])
+                slot = hidden_states.new_zeros(
+                    (input_embeds.shape[0], hidden_states.shape[1])
+                )
+                slot[:rows] = hidden_states[:rows]
+                hidden_states = slot
+
             hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
 
             hidden_states = self.fc(hidden_states)
@@ -301,6 +320,29 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+
+            # A TP1 sidecar is self-contained: load the full target
+            # embedding and native quantized lm_head from the same checkpoint.
+            # Normal colocated TP2 MTP workers keep the original sharing path.
+            if self._load_full_embed_head:
+                sidecar_name = None
+
+                if (
+                    name.endswith("language_model.embed_tokens.weight")
+                    or name == "model.embed_tokens.weight"
+                ):
+                    sidecar_name = "model.embed_tokens.weight"
+                elif name.startswith("lm_head."):
+                    sidecar_name = name
+
+                if sidecar_name is not None and sidecar_name in params_dict:
+                    param = params_dict[sidecar_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(sidecar_name)
+                    continue
 
             # Only process MTP branch weights
             if "mtp" not in name:

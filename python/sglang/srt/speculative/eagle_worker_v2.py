@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -26,7 +27,6 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.moe.utils import (
-    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -50,7 +50,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
-    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -86,6 +85,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    draft_pp_context,
     draft_tp_context,
     fast_sample,
     get_plan_stream,
@@ -164,16 +164,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+        ), draft_pp_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
-                ps=replace(ps, pp_rank=0),
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
+                random_seed=target_worker.random_seed,
             )
 
         # Alias for better readability
@@ -197,13 +198,58 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+        # Share target embedding/lm_head after the target pool has been sized,
+        # but before the draft pool is allocated. This releases the temporary
+        # draft copies and leaves headroom for CUDA graph capture.
+        self.init_token_map()
+        self.init_lm_head()
+
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+
+        # Probe: allocate an independent draft KV/request pool on the CUDA2
+        # TP1 sidecar.  Reuse the resolved target memory-pool configuration so
+        # the sidecar capacity tracks the target instead of consuming all free
+        # memory on GPU2.
+        if getattr(self, "_mtp_sidecar_probe", None) is not None:
+            from sglang.srt.distributed.parallel_state import get_self_pp_group
+
+            sidecar_gpu_id = self._mtp_sidecar_probe.gpu_id
+            target_gpu_id = self.ps.gpu_id
+
+            try:
+                torch.cuda.set_device(sidecar_gpu_id)
+
+                with (
+                    draft_tp_context(get_self_pp_group()),
+                    draft_pp_context(),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    self._mtp_sidecar_probe.alloc_memory_pool(
+                        memory_pool_config=memory_pool_config,
+                    )
+
+                mr = self._mtp_sidecar_probe.model_runner
+                free_b, total_b = torch.cuda.mem_get_info(sidecar_gpu_id)
+
+                logger.info(
+                    "[MTP-SIDECAR-POOL] CUDA%d local pool ready; "
+                    "tokens=%d req_pool=%s kv_allocator=%s "
+                    "free=%.2f GiB / total=%.2f GiB",
+                    sidecar_gpu_id,
+                    mr.max_total_num_tokens,
+                    mr.req_to_token_pool.req_to_token.device,
+                    type(mr.token_to_kv_pool_allocator).__name__,
+                    free_b / (1 << 30),
+                    total_b / (1 << 30),
+                )
+            finally:
+                torch.cuda.set_device(target_gpu_id)
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -229,6 +275,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
+
+        # Initialize the independent TP1 MTP sidecar attention backend on
+        # CUDA2.  Keep it inside the singleton TP/PP contexts used when the
+        # sidecar worker was constructed.
+        if getattr(self, "_mtp_sidecar_probe", None) is not None:
+            from sglang.srt.distributed.parallel_state import get_self_pp_group
+
+            sidecar_gpu_id = self._mtp_sidecar_probe.gpu_id
+            target_gpu_id = self.ps.gpu_id
+
+            try:
+                torch.cuda.set_device(sidecar_gpu_id)
+
+                with (
+                    draft_tp_context(get_self_pp_group()),
+                    draft_pp_context(),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    self._mtp_sidecar_probe.init_attention_backends()
+
+                mr = self._mtp_sidecar_probe.model_runner
+                logger.info(
+                    "[MTP-SIDECAR-ATTN] CUDA%d attention backend ready: %s",
+                    sidecar_gpu_id,
+                    type(mr.attn_backend).__name__,
+                )
+            finally:
+                torch.cuda.set_device(target_gpu_id)
 
     def init_cuda_graphs(self):
         with (
@@ -306,7 +381,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
 
         else:
-            if self.hot_token_id is not None:
+            if self.hot_token_id is not None and head is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
@@ -321,6 +396,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
+            self.server_args,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -397,21 +473,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        supports_hip_draft_extend_graph = False
+        supports_hip_aiter_draft_extend_graph = False
         if _is_hip:
-            # Keep imports local so non-HIP environments do not require these.
-            # aiter packs draft-extend support into the decode (multi-step)
-            # backend; DSV4 exposes it on the draft-extend backend itself.
+            # Keep import local so non-HIP environments do not require aiter.
             from sglang.srt.layers.attention.aiter_backend import (
                 AiterMultiStepDraftBackend,
             )
-            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-                DeepseekV4HipRadixBackend,
-            )
 
-            supports_hip_draft_extend_graph = isinstance(
+            supports_hip_aiter_draft_extend_graph = isinstance(
                 self.draft_attn_backend, AiterMultiStepDraftBackend
-            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+            )
 
         graph_supported_backend_types = [
             TritonAttnBackend,
@@ -456,7 +527,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 _is_npu
                 or _is_xpu
                 or supports_cuda_draft_extend_graph
-                or supports_hip_draft_extend_graph
+                or supports_hip_aiter_draft_extend_graph
             )
         ):
             tic = time.perf_counter()
@@ -726,6 +797,402 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def draft_extend(self):
         pass
 
+    def _mtp_sidecar_shadow_prefill(
+        self,
+        batch,
+        target_hidden_states,
+        next_token_ids,
+        mm_input_embeds=None,
+    ):
+        """One-shot eager prefill probe on the CUDA2 TP1 MTP sidecar.
+
+        This is deliberately shadow-only: the normal colocated draft result
+        remains authoritative.  Failure here must not break serving.
+        """
+        sidecar = getattr(self, "_mtp_sidecar_probe", None)
+        if sidecar is None:
+            return
+
+        if getattr(self, "_mtp_sidecar_shadow_prefill_attempted", False):
+            return
+
+        if batch.forward_mode.is_idle() or len(batch.reqs) != 1:
+            return
+
+        # For the first proof, require no target prefix-cache hit.  The sidecar
+        # has an independent cache and therefore cannot reuse target KV.
+        if int(batch.prefix_lens[0]) != 0:
+            return
+
+        self._mtp_sidecar_shadow_prefill_attempted = True
+
+        import copy as _copy
+
+        from sglang.srt.distributed.parallel_state import get_self_pp_group
+        from sglang.srt.managers.schedule_batch import (
+            set_mamba_track_indices_from_reqs,
+        )
+
+        sidecar_gpu_id = sidecar.gpu_id
+        target_gpu_id = self.ps.gpu_id
+        sidecar_device = f"cuda:{sidecar_gpu_id}"
+
+        def _to_sidecar(t):
+            if t is None:
+                return None
+            if not isinstance(t, torch.Tensor):
+                return t
+            # Avoid relying on CUDA peer access between the target 5070 and
+            # the 5060.  This is a correctness probe, so stage through CPU.
+            if t.device.type == "cuda":
+                t = t.detach().to("cpu")
+            return t.to(sidecar_device)
+
+        try:
+            torch.cuda.set_device(sidecar_gpu_id)
+
+            mr = sidecar.model_runner
+
+            # get_rope() uses a process-wide module cache.  The target model
+            # therefore leaves the shared RoPE cache on CUDA0 even though this
+            # sidecar model itself lives on CUDA2.  Never move that shared
+            # object in-place: doing so would also break the target model.
+            #
+            # Give the sidecar private RotaryEmbedding instances and migrate
+            # only those copies to the sidecar device.
+            if not getattr(self, "_mtp_sidecar_rope_isolated", False):
+                _side_device = torch.device("cuda", sidecar_gpu_id)
+                _rope_clones = {}
+                _num_rope_users = 0
+
+                for _mod_name, _mod in mr.model.named_modules():
+                    _rope = getattr(_mod, "rotary_emb", None)
+                    if _rope is None:
+                        continue
+
+                    _key = id(_rope)
+                    _private_rope = _rope_clones.get(_key)
+
+                    if _private_rope is None:
+                        _private_rope = _copy.deepcopy(_rope)
+                        _private_rope = _private_rope.to(_side_device)
+
+                        # Be explicit in case this exact image keeps the cache
+                        # as an ordinary tensor rather than a registered buffer.
+                        _cache = getattr(_private_rope, "cos_sin_cache", None)
+                        if isinstance(_cache, torch.Tensor):
+                            _private_rope.cos_sin_cache = _cache.to(_side_device)
+
+                        _rope_clones[_key] = _private_rope
+
+                    _mod.rotary_emb = _private_rope
+                    _num_rope_users += 1
+
+                self._mtp_sidecar_rope_isolated = True
+
+                logger.info(
+                    "[MTP-SIDECAR-ROPE] isolated %d users into %d private CUDA%d RoPE object(s)",
+                    _num_rope_users,
+                    len(_rope_clones),
+                    sidecar_gpu_id,
+                )
+
+            # A standalone TpModelWorker does not pass through the normal
+            # EAGLE cuda-graph initialization path.  init_cuda_graphs() also
+            # creates the EagerRunner and the runner attributes expected by
+            # ModelRunner.forward().  Initialize through the official path,
+            # then force this shadow probe back to eager-only execution.
+            if (
+                not hasattr(mr, "eager_runner")
+                or not hasattr(mr, "prefill_cuda_graph_runner")
+                or not hasattr(mr, "decode_cuda_graph_runner")
+            ):
+                with (
+                    draft_tp_context(get_self_pp_group()),
+                    draft_pp_context(),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    mr.init_cuda_graphs(capture_decode_cuda_graph=False)
+
+                mr.prefill_cuda_graph_runner = None
+                mr.decode_cuda_graph_runner = None
+
+                logger.info(
+                    "[MTP-SIDECAR-SHADOW] CUDA%d eager runner initialized",
+                    sidecar_gpu_id,
+                )
+
+            side_req_pool = mr.req_to_token_pool
+            side_kv_alloc = mr.token_to_kv_pool_allocator
+
+            # Persistent target Req objects must never be handed to the
+            # sidecar pool because pool.alloc() mutates req_pool_idx and
+            # Mamba ownership fields.  Use an isolated request clone.
+            target_req = batch.reqs[0]
+            side_req = _copy.copy(target_req)
+
+            side_req.req_pool_idx = None
+            side_req.mamba_pool_idx = None
+            side_req.mamba_ping_pong_track_buffer = None
+            side_req.mamba_next_track_idx = None
+            side_req.mamba_last_track_seqlen = None
+            side_req.mamba_branching_seqlen = None
+            side_req.mamba_cow_src_index = None
+            side_req.mamba_needs_clear = False
+            side_req.mamba_lazy_is_insert = True
+
+            side_req.kv_committed_len = 0
+            side_req.kv = None
+            side_req.extend_batch_idx = 0
+            side_req.decode_batch_idx = 0
+
+            side_req.prefix_indices = torch.empty(
+                (0,), dtype=torch.int64, device=sidecar_device
+            )
+            side_req.last_node = None
+            side_req.last_host_node = None
+            side_req.best_match_node = None
+            side_req.cache_protected_len = 0
+            side_req.num_matched_prefix_tokens = 0
+            side_req.host_hit_length = 0
+            side_req.swa_host_hit_length = 0
+            side_req.mamba_host_hit_length = 0
+
+            rows = side_req_pool.alloc([side_req])
+            if rows is None:
+                raise RuntimeError("CUDA2 sidecar request pool allocation failed")
+
+            side_req_idx = int(rows[0])
+
+            extend_num_tokens = int(batch.extend_num_tokens)
+            side_out_cache_loc = side_kv_alloc.alloc(extend_num_tokens)
+            if side_out_cache_loc is None:
+                raise RuntimeError(
+                    f"CUDA2 sidecar KV allocation failed: need={extend_num_tokens}"
+                )
+
+            prefix_len = int(batch.prefix_lens[0])
+            seq_len = int(batch.seq_lens_cpu[0])
+            extend_len = int(batch.extend_lens[0])
+
+            if extend_len != extend_num_tokens:
+                raise RuntimeError(
+                    f"unexpected probe shape: extend_len={extend_len}, "
+                    f"extend_num_tokens={extend_num_tokens}"
+                )
+
+            # page_size == 1: map this extend directly into the independent
+            # CUDA2 request row.
+            side_req_pool.write(
+                (side_req_idx, slice(prefix_len, seq_len)),
+                side_out_cache_loc[:extend_len],
+            )
+            side_req.kv_committed_len = seq_len
+
+            # Build an isolated ScheduleBatch view.  Never mutate the target
+            # batch because the normal colocated draft still runs afterwards.
+            side_batch = _copy.copy(batch)
+            side_batch.reqs = [side_req]
+            side_batch.req_to_token_pool = side_req_pool
+            side_batch.token_to_kv_pool_allocator = side_kv_alloc
+            side_batch.device = sidecar_device
+
+            side_batch.req_pool_indices_cpu = torch.tensor(
+                [side_req_idx], dtype=torch.int64
+            )
+            side_batch.req_pool_indices = side_batch.req_pool_indices_cpu.to(
+                sidecar_device
+            )
+
+            side_batch.seq_lens_cpu = batch.seq_lens_cpu.clone()
+            side_batch.seq_lens = _to_sidecar(batch.seq_lens)
+            side_batch.orig_seq_lens = _to_sidecar(batch.orig_seq_lens)
+            side_batch.out_cache_loc = side_out_cache_loc
+
+            # Recreate the shifted MTP prefill token stream without touching
+            # batch.input_ids.
+            tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+            new_input_ids = torch.empty_like(batch.input_ids)
+            pt = 0
+            for i, cur_extend_len in enumerate(batch.extend_lens):
+                input_ids = batch.input_ids[pt : pt + cur_extend_len]
+                new_input_ids[pt : pt + cur_extend_len].copy_(
+                    torch.cat(
+                        (input_ids[1:], tail_tokens[i].reshape(1))
+                    )
+                )
+                pt += cur_extend_len
+
+            side_batch.input_ids = _to_sidecar(new_input_ids)
+
+            side_batch.spec_info = EagleDraftExtendInput(
+                hidden_states=_to_sidecar(target_hidden_states),
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+
+            # Shape-dependent tracking data can be mirrored; slot identities
+            # must be rebuilt from the CUDA2 HybridReqToTokenPool.
+            side_batch.mamba_track_mask = _to_sidecar(
+                getattr(batch, "mamba_track_mask", None)
+            )
+            side_batch.mamba_track_seqlens = _to_sidecar(
+                getattr(batch, "mamba_track_seqlens", None)
+            )
+            side_batch.mamba_lazy_spec_track_positions_cpu = None
+
+            if hasattr(side_req_pool, "mamba_pool"):
+                set_mamba_track_indices_from_reqs(side_batch)
+                side_batch._collect_deferred_mamba_cow_and_clear([side_req])
+
+            capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+
+            with (
+                draft_tp_context(get_self_pp_group()),
+                draft_pp_context(),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                forward_batch = ForwardBatch.init_new(
+                    side_batch,
+                    mr,
+                    capture_hidden_mode=capture_hidden_mode,
+                    return_hidden_states_before_norm=False,
+                )
+                forward_batch.return_logprob = False
+
+                if mm_input_embeds is not None:
+                    forward_batch.mm_input_embeds = _to_sidecar(mm_input_embeds)
+
+                # Diagnose any target/CPU tensors that survived ForwardBatch.init_new.
+                for _name in (
+                    "input_ids",
+                    "positions",
+                    "seq_lens",
+                    "req_pool_indices",
+                    "out_cache_loc",
+                    "mamba_track_indices",
+                    "mamba_track_mask",
+                    "mamba_track_seqlens",
+                ):
+                    _v = getattr(forward_batch, _name, None)
+                    if isinstance(_v, torch.Tensor):
+                        logger.info(
+                            "[MTP-SIDECAR-DEV] %s device=%s dtype=%s shape=%s",
+                            _name,
+                            _v.device,
+                            _v.dtype,
+                            tuple(_v.shape),
+                        )
+
+                _spec = getattr(forward_batch, "spec_info", None)
+                if _spec is not None:
+                    _h = getattr(_spec, "hidden_states", None)
+                    if isinstance(_h, torch.Tensor):
+                        logger.info(
+                            "[MTP-SIDECAR-DEV] spec.hidden_states device=%s dtype=%s shape=%s",
+                            _h.device,
+                            _h.dtype,
+                            tuple(_h.shape),
+                        )
+
+                # Inspect the persistent tensors passed directly into
+                # fused_qk_gemma_rmsnorm_rope_gate.
+                for _mod_name, _mod in mr.model.named_modules():
+                    if not (
+                        hasattr(_mod, "q_norm")
+                        and hasattr(_mod, "k_norm")
+                        and hasattr(_mod, "rotary_emb")
+                        and hasattr(_mod, "forward_prepare_cuda_fused")
+                    ):
+                        continue
+
+                    _qnorm = getattr(_mod.q_norm, "weight", None)
+                    _knorm = getattr(_mod.k_norm, "weight", None)
+                    _rope = getattr(_mod.rotary_emb, "cos_sin_cache", None)
+
+                    logger.info(
+                        "[MTP-SIDECAR-PTR] module=%s qnorm=%s knorm=%s rope=%s",
+                        _mod_name,
+                        (
+                            str(_qnorm.device)
+                            if isinstance(_qnorm, torch.Tensor)
+                            else type(_qnorm).__name__
+                        ),
+                        (
+                            str(_knorm.device)
+                            if isinstance(_knorm, torch.Tensor)
+                            else type(_knorm).__name__
+                        ),
+                        (
+                            str(_rope.device)
+                            if isinstance(_rope, torch.Tensor)
+                            else type(_rope).__name__
+                        ),
+                    )
+
+                # The normal draft_tp_context only patches _TP.  Qwen3.5/3.8
+                # layer communication also consults the separate global
+                # _ATTN_TP, which still points at the target TP2 NCCL group.
+                # For this TP1 CUDA2 sidecar, temporarily make both groups the
+                # same singleton coordinator and restore the target group
+                # immediately after the forward.
+                import sglang.srt.distributed.parallel_state as _ps
+
+                _side_tp_group = get_self_pp_group()
+                _saved_attn_tp = _ps._ATTN_TP
+
+                try:
+                    _ps._ATTN_TP = _side_tp_group
+                    with (
+                        draft_tp_context(_side_tp_group),
+                        draft_pp_context(),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                    ):
+                        side_logits = mr.forward(forward_batch).logits_output
+                finally:
+                    _ps._ATTN_TP = _saved_attn_tp
+
+            if side_logits.next_token_logits is None:
+                raise RuntimeError("CUDA2 sidecar returned no next_token_logits")
+
+            probe_token = int(
+                torch.argmax(
+                    side_logits.next_token_logits[-1],
+                    dim=-1,
+                ).item()
+            )
+
+            logger.info(
+                "[MTP-SIDECAR-SHADOW] eager prefill SUCCESS "
+                "CUDA%d req_row=%d seq_len=%d extend=%d "
+                "logits=%s hidden=%s argmax=%d",
+                sidecar_gpu_id,
+                side_req_idx,
+                seq_len,
+                extend_len,
+                tuple(side_logits.next_token_logits.shape),
+                (
+                    tuple(side_logits.hidden_states.shape)
+                    if side_logits.hidden_states is not None
+                    else None
+                ),
+                probe_token,
+            )
+
+        except Exception:
+            logger.exception(
+                "[MTP-SIDECAR-SHADOW] eager prefill FAILED"
+            )
+        finally:
+            torch.cuda.set_device(target_gpu_id)
+
     def _draft_extend_for_prefill(
         self,
         batch: ScheduleBatch,
@@ -741,6 +1208,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # One-shot CUDA2 shadow execution.  It never replaces the normal
+        # colocated draft result at this stage.
+        self._mtp_sidecar_shadow_prefill(
+            batch,
+            target_hidden_states,
+            next_token_ids,
+            mm_input_embeds,
+        )
+
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1025,22 +1501,96 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = get_schedule().page_size
+        self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
 
-        self._draft_worker = EagleDraftWorker(
-            server_args,
-            gpu_id,
-            ps,
-            nccl_port,
-            target_worker,
+        # The draft runs where the target's last-layer hidden states and sampled
+        # tokens exist, i.e. only on the last pipeline stage. Other stages keep an
+        # EAGLEWorkerV2 that forwards the target and returns proxy tensors, so the
+        # scheduler's dispatch and run_batch branching stay rank-uniform.
+        self._hosts_draft = get_pp_group().is_last_rank
+        self._draft_worker = (
+            EagleDraftWorker(
+                server_args,
+                gpu_id,
+                ps,
+                nccl_port,
+                target_worker,
+            )
+            if self._hosts_draft
+            else None
         )
+
+        # Local 3-GPU MTP sidecar probe.
+        #
+        # Keep the normal draft path completely untouched.  On target TP rank 0
+        # additionally construct one independent TP1 draft model on CUDA2.
+        # It is NOT connected to inference or KV pools yet.
+        self._mtp_sidecar_probe = None
+
+        if (
+            self._hosts_draft
+            and ps.tp_rank == 0
+            and torch.cuda.is_available()
+            and torch.cuda.device_count() >= 3
+        ):
+            from sglang.srt.distributed.parallel_state import get_self_pp_group
+
+            sidecar_gpu_id = 2
+            sidecar_ps = ParallelState.trivial(gpu_id=sidecar_gpu_id)
+            target_gpu_id = ps.gpu_id
+
+            logger.info(
+                "[MTP-SIDECAR-PROBE] building TP1 draft on CUDA%d (%s)",
+                sidecar_gpu_id,
+                torch.cuda.get_device_name(sidecar_gpu_id),
+            )
+
+            try:
+                # Reuse this rank's already-created singleton process group as
+                # the temporary TP1 group.  This is the part we are explicitly
+                # testing; if the coordinator is too tightly bound to the
+                # target CUDA device, startup will tell us here.
+                with (
+                    draft_tp_context(get_self_pp_group()),
+                    draft_pp_context(),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    self._mtp_sidecar_probe = TpModelWorker(
+                        server_args=server_args,
+                        gpu_id=sidecar_gpu_id,
+                        ps=sidecar_ps,
+                        nccl_port=nccl_port,
+                        is_draft_worker=True,
+                        context_length=target_worker.model_runner.model_config.context_len,
+                        random_seed=target_worker.random_seed,
+                    )
+
+                free_b, total_b = torch.cuda.mem_get_info(sidecar_gpu_id)
+                logger.info(
+                    "[MTP-SIDECAR-PROBE] loaded on CUDA%d; "
+                    "free=%.2f GiB / total=%.2f GiB",
+                    sidecar_gpu_id,
+                    free_b / (1 << 30),
+                    total_b / (1 << 30),
+                )
+            finally:
+                # TpModelWorker switches the current CUDA device during init.
+                # Put rank0 back on its target 5070 before normal startup continues.
+                torch.cuda.set_device(target_gpu_id)
+
+        # The CUDA2 sidecar is owned by the outer EAGLEWorkerV2, while
+        # alloc_memory_pool() runs on the inner EagleDraftWorker.  Hand the
+        # same TpModelWorker reference down; TP1 simply receives None.
+        if self._draft_worker is not None:
+            self._draft_worker._mtp_sidecar_probe = self._mtp_sidecar_probe
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
-        if server_args.speculative_adaptive:
+        if server_args.speculative_adaptive and self._hosts_draft:
             self.adaptive_controller = AdaptiveController(
                 self,
                 config_path=server_args.speculative_adaptive_config,
@@ -1055,7 +1605,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
-    def last_shared_read_runner(self):
+    def war_fastpath_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
@@ -1103,7 +1653,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
@@ -1113,7 +1667,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
+                batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=target_capture_mode,
             )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
@@ -1122,6 +1678,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # A rank that does not host the draft (prefill-side PP builds it only on
+            # the last stage) forwards the target's proxy tensors and stops here.
+            if self._draft_worker is None:
+                return batch_output
 
             # Draft prefill
             with (
