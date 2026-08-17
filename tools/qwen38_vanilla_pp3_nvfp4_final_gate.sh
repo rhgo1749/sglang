@@ -8,8 +8,11 @@ PORT="${PORT:-30000}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-3}"
 MAX_MAMBA="${MAX_MAMBA:-3}"
-PARTITION="${PARTITION:-19,23,22}"
+# 19,23,22 fit the raw 3x256K KV pool, but PP2 exhausted runtime
+# headroom on the first functional request. Move one layer PP2 -> PP0.
+PARTITION="${PARTITION:-20,23,21}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 REQUIRED=$((CTX * MAX_RUNNING))
 
 cleanup() {
@@ -32,6 +35,7 @@ echo '============================================================'
 echo ' QWEN3.8 FINAL VANILLA PP3 + NVFP4 RAW 3x256K GATE'
 echo " partition=${PARTITION}"
 echo " mem_fraction_static=${MEM_FRACTION_STATIC}"
+echo " pytorch_cuda_alloc_conf=${PYTORCH_CUDA_ALLOC_CONF}"
 echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " required=${REQUIRED}"
@@ -54,6 +58,7 @@ docker run -d \
   --ulimit memlock=-1 \
   --ulimit stack=67108864 \
   -e "SGLANG_PP_LAYER_PARTITION=${PARTITION}" \
+  -e "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
   -p "${PORT}:30000" \
   -v sglang-hf-cache:/root/.cache/huggingface \
   "$IMAGE" \
@@ -122,6 +127,20 @@ cap,req=map(int,sys.argv[1:])
 print(f'capacity_ratio={cap/req:.6f}')
 print(f'equal_share_tokens_per_session={cap//3}')
 print(f'raw_3x256k_capacity_gate={cap>=req}')
+PY
+
+python3 - "$LOG" <<'PY'
+import re,sys
+text=open(sys.argv[1],errors='replace').read()
+vals={}
+for pp,mem in re.findall(r'PP(\d+).*?available_gpu_mem=([0-9.]+) GB',text):
+    vals[int(pp)]=float(mem)
+for pp in sorted(vals):
+    print(f'pp{pp}_runtime_headroom_gb={vals[pp]:.2f}')
+if vals:
+    print(f'min_runtime_headroom_gb={min(vals.values()):.2f}')
+else:
+    print('min_runtime_headroom_gb=unknown')
 PY
 
 if (( CAP < REQUIRED )); then
