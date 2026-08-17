@@ -67,7 +67,7 @@ docker logs "$CONTAINER" 2>&1 | \
 echo
 echo '=== MTP PHYSICAL MEMORY AUDIT ==='
 docker logs "$CONTAINER" 2>&1 | \
-  grep -E '\[MTP-(EARLY-SHARE|MEM-AUDIT|MEM-TOP)\]' || true
+  grep -E '\[MTP-(EARLY-SHARE|PP-FP8-EMBED|MEM-AUDIT|MEM-TOP)\]' || true
 
 echo
 echo '=== LOAD / MEMORY / MTP SUMMARY ==='
