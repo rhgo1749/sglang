@@ -10,6 +10,7 @@ MEM_FRACTION_STATIC="${MTP_P3_MEM_FRACTION_STATIC:-0.80}"
 MAX_RUNNING="${MTP_P3_MAX_RUNNING:-3}"
 MAX_MAMBA="${MTP_P3_MAX_MAMBA:-10}"
 OUTPUT_TOKENS="${MTP_P3_OUTPUT_TOKENS:-64}"
+REQUEST_TIMEOUT="${MTP_P3_REQUEST_TIMEOUT:-180}"
 
 cd "$REPO"
 
@@ -31,8 +32,8 @@ if ! grep -q 'nvfp4' "$HELP_OUT" || ! grep -q 'trtllm_mha' "$HELP_OUT"; then
   grep -E -- 'kv-cache-dtype|attention-backend|trtllm_mha|nvfp4' "$HELP_OUT" | head -100 || true
   exit 1
 fi
-echo 'target: NVFP4 KV (FlashInfer prefill + TRTLLM-MHA decode)'
-echo 'CUDA2 draft: FP8 E4M3 KV (FlashInfer multi-step; private ServerArgs view)'
+echo 'target: NVFP4 KV (FlashInfer prefill + TRTLLM-MHA decode, page_size=64)'
+echo 'CUDA2 draft: FP8 E4M3 KV (FlashInfer multi-step, private page_size=1)'
 
 echo '=== APPLY AUTHORITATIVE CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
@@ -47,6 +48,9 @@ python3 tools/qwen38_mtp_cutover_pool_gate_hotfix.py --commit
 
 echo '=== HOTFIX NVFP4 TARGET / FP8 CUDA2 DRAFT ==='
 python3 tools/qwen38_mtp_cutover_nvfp4_target_hotfix.py --commit
+
+echo '=== HOTFIX CUDA2 SIDECAR PAGE_SIZE=1 ==='
+python3 tools/qwen38_mtp_cutover_sidecar_page1_hotfix.py --commit
 
 echo '=== RECREATE SERVER: NVFP4 TARGET KV, FP8 DRAFT KV, LOGICAL 256K x 3 ==='
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -97,10 +101,10 @@ echo "StartedAt: $STARTED"
 dump_failure() {
   echo '=== FAILURE SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory' | \
-    tail -520 || true
+    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory|NCCL|Connection closed' | \
+    tail -620 || true
   echo '=== FAILURE TAIL ==='
-  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -360 || true
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -420 || true
   echo '=== CONTAINER STATUS ==='
   docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER" || true
 }
@@ -120,7 +124,7 @@ fi
 echo '=== STARTUP GATES ==='
 START_LOG="$(mktemp)"
 docker logs --since "$STARTED" "$CONTAINER" >"$START_LOG" 2>&1 || true
-grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -360 || true
+grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -420 || true
 
 if ! grep -q '\[MTP-CUTOVER-KV\] target=nvfp4 CUDA2 draft=fp8_e4m3' "$START_LOG"; then
   echo 'ERROR: CUDA2 private FP8 draft-KV override did not activate'
@@ -132,6 +136,11 @@ if ! grep -q 'draft_kv_dtype=torch.float8_e4m3fn' "$START_LOG"; then
   dump_failure
   exit 1
 fi
+if ! grep -Eq '\[MTP-CUTOVER-PAGE\].*draft_page_size=1.*allocator=.*TokenToKVPoolAllocator' "$START_LOG"; then
+  echo 'ERROR: CUDA2 draft did not isolate to page_size=1 token allocator'
+  dump_failure
+  exit 1
+fi
 
 TARGET_TOKENS="$(sed -nE 's/.*MTP-CUTOVER-POOL.*target_rank=0 target_tokens=([0-9]+).*/\1/p' "$START_LOG" | tail -1)"
 SIDE_TOKENS="$(sed -nE 's/.*MTP-CUTOVER-POOL.*CUDA2 side_tokens=([0-9]+).*/\1/p' "$START_LOG" | tail -1)"
@@ -140,7 +149,7 @@ if [[ -z "$TARGET_TOKENS" || -z "$SIDE_TOKENS" ]]; then
   dump_failure
   exit 1
 fi
-printf 'target_kv=nvfp4\ndraft_kv=fp8_e4m3\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
+printf 'target_kv=nvfp4\ntarget_page_size=64\ndraft_kv=fp8_e4m3\ndraft_page_size=1\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
   "$TARGET_TOKENS" "$SIDE_TOKENS" "$MAX_RUNNING"
 
 POOL_MIN="$TARGET_TOKENS"
@@ -153,7 +162,7 @@ if (( PER_PROMPT < 4096 )); then
   exit 1
 fi
 
-echo "=== PARALLEL-${MAX_RUNNING} STRESS: ${PER_PROMPT} TOKENS EACH + ${OUTPUT_TOKENS} ==="
+echo "=== PARALLEL-${MAX_RUNNING} STRESS: ${PER_PROMPT} TOKENS EACH + ${OUTPUT_TOKENS} (timeout=${REQUEST_TIMEOUT}s) ==="
 for i in $(seq 0 $((MAX_RUNNING - 1))); do
   python3 - "$i" "$PER_PROMPT" "$OUTPUT_TOKENS" <<'PY'
 import json, sys
@@ -171,7 +180,7 @@ PIDS=()
 START_NS="$(date +%s%N)"
 for i in $(seq 0 $((MAX_RUNNING - 1))); do
   (
-    curl -sS \
+    curl --max-time "$REQUEST_TIMEOUT" -sS \
       -o "/tmp/qwen38-nvfp4-p3-${i}-response.json" \
       -w '%{http_code}' \
       http://127.0.0.1:30000/generate \
@@ -201,7 +210,8 @@ print(f'parallel_wall_sec={wall:.3f}')
 all_ok = True
 sum_prompt = sum_completion = 0
 for i in range(nr):
-    http = pathlib.Path(f'/tmp/qwen38-nvfp4-p3-{i}-http.txt').read_text().strip()
+    http_path = pathlib.Path(f'/tmp/qwen38-nvfp4-p3-{i}-http.txt')
+    http = http_path.read_text().strip() if http_path.exists() else ''
     print(f'req{i}_http={http}')
     try:
         d = json.load(open(f'/tmp/qwen38-nvfp4-p3-{i}-response.json'))
@@ -234,7 +244,7 @@ if [[ $RC -ne 0 || $PY_RC -ne 0 ]]; then
 fi
 
 echo '=== PARALLEL CUTOVER LOG ==='
-grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND|KV)|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|CUDA error|illegal memory|out of memory' "$REQ_LOG" | tail -420 || true
+grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND|KV|PAGE)|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|CUDA error|illegal memory|out of memory' "$REQ_LOG" | tail -520 || true
 
 echo '=== CONTAINER STATUS ==='
 docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER"
