@@ -1,0 +1,27 @@
+from pathlib import Path
+
+SCHED = Path("/sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py")
+s = SCHED.read_text()
+
+marker = "[MTP-PP-PHASE]"
+if marker not in s:
+    raise RuntimeError("MTP PP phase diagnostics must be applied first")
+
+if "[MTP-PP-IDENTITY]" in s:
+    print("native MTP PP identity diagnostics already present")
+else:
+    anchor = '''                        _mtp_values = []\n                        for _req in cur_batch.reqs:\n'''
+    inject = '''                        _mtp_req_diag = []\n                        for _req in cur_batch.reqs:\n                            _mm = getattr(_req, "multimodal_inputs", None)\n                            _inp = getattr(_req, "input_embeds", None)\n                            _pos = getattr(_req, "positional_embed_overrides", None)\n                            try:\n                                _fill_n = len(_req.get_fill_ids())\n                            except Exception:\n                                _fill_n = -1\n                            _mtp_req_diag.append({\n                                "rid": str(getattr(_req, "rid", None)),\n                                "origin_n": len(getattr(_req, "origin_input_ids", []) or []),\n                                "output_n": len(getattr(_req, "output_ids", []) or []),\n                                "fill_n": _fill_n,\n                                "prefix_n": len(getattr(_req, "prefix_indices", []) or []),\n                                "mm": type(_mm).__name__ if _mm is not None else None,\n                                "input_embeds": (\n                                    tuple(_inp.shape)\n                                    if hasattr(_inp, "shape")\n                                    else (len(_inp) if _inp is not None else None)\n                                ),\n                                "pos_override": type(_pos).__name__ if _pos is not None else None,\n                            })\n                        _batch_mm = getattr(cur_batch, "multimodal_inputs", None)\n                        _batch_inp = getattr(cur_batch, "input_embeds", None)\n                        _batch_rep = getattr(cur_batch, "replace_embeds", None)\n                        _batch_pos = getattr(cur_batch, "replace_positions", None)\n                        logger.info(\n                            "[MTP-PP-IDENTITY] req=%s batch_mm=%s batch_input_embeds=%s "\n                            "replace_embeds=%s replace_positions=%s",\n                            _mtp_req_diag,\n                            (\n                                [type(x).__name__ if x is not None else None for x in _batch_mm]\n                                if isinstance(_batch_mm, list)\n                                else type(_batch_mm).__name__ if _batch_mm is not None else None\n                            ),\n                            tuple(_batch_inp.shape) if hasattr(_batch_inp, "shape") else None,\n                            tuple(_batch_rep.shape) if hasattr(_batch_rep, "shape") else None,\n                            tuple(_batch_pos.shape) if hasattr(_batch_pos, "shape") else None,\n                        )\n\n                        _mtp_values = []\n                        for _req in cur_batch.reqs:\n'''
+    if anchor not in s:
+        raise RuntimeError("MTP PP Req reconstruction anchor not found")
+    s = s.replace(anchor, inject, 1)
+
+    old_oob = '''                            if _min_id < 0 or _max_id >= _vocab:\n                                raise RuntimeError(\n'''
+    new_oob = '''                            if _min_id < 0 or _max_id >= _vocab:\n                                _oob = [\n                                    (i, int(tok))\n                                    for i, tok in enumerate(_mtp_values)\n                                    if int(tok) < 0 or int(tok) >= _vocab\n                                ]\n                                logger.error(\n                                    "[MTP-PP-OOB-IDENTITY] oob=%s req=%s batch_mm=%s "\n                                    "batch_input_embeds=%s replace_embeds=%s replace_positions=%s",\n                                    _oob[:16],\n                                    _mtp_req_diag,\n                                    (\n                                        [type(x).__name__ if x is not None else None for x in _batch_mm]\n                                        if isinstance(_batch_mm, list)\n                                        else type(_batch_mm).__name__ if _batch_mm is not None else None\n                                    ),\n                                    tuple(_batch_inp.shape) if hasattr(_batch_inp, "shape") else None,\n                                    tuple(_batch_rep.shape) if hasattr(_batch_rep, "shape") else None,\n                                    tuple(_batch_pos.shape) if hasattr(_batch_pos, "shape") else None,\n                                )\n                                raise RuntimeError(\n'''
+    if old_oob not in s:
+        raise RuntimeError("MTP PP OOB guard anchor not found")
+    s = s.replace(old_oob, new_oob, 1)
+
+    SCHED.write_text(s)
+    print("PATCHED native MTP PP request/MM identity diagnostics")
+    print(SCHED)
