@@ -20,6 +20,9 @@ python3 tools/qwen38_mtp_sidecar_cutover.py --commit
 echo '=== HOTFIX NESTED PP CONTEXT ==='
 python3 tools/qwen38_mtp_cutover_pp_hotfix.py
 
+echo '=== HOTFIX SIDECAR MAMBA TRACKING ==='
+python3 tools/qwen38_mtp_cutover_mamba_tracking_hotfix.py
+
 echo "=== RECREATE SERVER (mem_fraction_static=${MEM_FRACTION_STATIC}) ==="
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
@@ -64,10 +67,10 @@ echo "StartedAt: $STARTED"
 dump_runtime_failure() {
   echo '=== REQUEST FAILURE CUTOVER SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-    grep -E 'MTP-CUTOVER|MTP-SIDECAR|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|Exception|RuntimeError|AssertionError|CUDA error|illegal memory|out of memory' | \
-    tail -320 || true
+    grep -E 'MTP-CUTOVER|MTP-SIDECAR|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|Exception|RuntimeError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory' | \
+    tail -360 || true
   echo '=== REQUEST FAILURE TAIL ==='
-  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -260 || true
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -280 || true
   echo '=== CONTAINER STATUS ==='
   docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER" || true
 }
@@ -88,16 +91,16 @@ done
   echo '=== FAILURE MEMORY / CUTOVER SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
     grep -E 'MTP-CUTOVER|Load weight end|Mamba Cache|KV Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|OutOfMemory|out of memory|Scheduler hit an exception|Traceback' | \
-    tail -220 || true
+    tail -240 || true
   echo '=== FAILURE TAIL ==='
-  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -180
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -200
   exit 1
 fi
 
 echo '=== STARTUP CUTOVER GATES ==='
 docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
   grep -E 'MTP-CUTOVER|MTP-SIDECAR|target_tokens|max_total_num_tokens|Memory pool end|available_gpu_mem|Scheduler hit an exception|Traceback' | \
-  tail -220 || true
+  tail -240 || true
 
 echo '=== MULTI-ITERATION DECODE ==='
 SHORT_HTTP="$(curl -sS \
@@ -186,8 +189,8 @@ PY
 
 echo '=== FINAL CUTOVER LOG ==='
 docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-  grep -E 'MTP-CUTOVER-(POOL|ATTN|GRAPH|ROPE|REQ|PREFILL|DRAFT|EXTEND)|MTP-CUTOVER]|Scheduler hit an exception|CUDA error|illegal memory|Traceback|Prefill batch|Decode batch' | \
-  tail -320 || true
+  grep -E 'MTP-CUTOVER-(MAMBA|POOL|ATTN|GRAPH|ROPE|REQ|PREFILL|DRAFT|EXTEND)|MTP-CUTOVER]|Scheduler hit an exception|CUDA error|illegal memory|Traceback|Prefill batch|Decode batch' | \
+  tail -360 || true
 
 echo '=== CONTAINER STATUS ==='
 docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER"
