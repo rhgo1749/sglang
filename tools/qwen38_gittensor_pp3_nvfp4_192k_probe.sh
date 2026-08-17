@@ -10,13 +10,18 @@ export CTX="${CTX:-196608}"
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-196608}"
 
 # Native MTP + row-wise FP8 embedding candidate.
-# 22,28,14 is a one-layer refinement of 23,27,14: move only target layer 22
-# from PP0 to PP1. Layer 22 is linear-attention, so the full-attention
-# distribution stays 5/7/4 and KV bytes/token do not increase. This targets
-# the only remaining local-capacity bottleneck (PP0=555328) while PP1/PP2
-# already reach the exact 3x196608 cap.
+# 22,28,14 moves only target layer 22 from PP0 to PP1 relative to 23,27,14.
+# Layer 22 is linear-attention, so the full-attention distribution stays 5/7/4
+# and KV bytes/token do not increase.  At mem_fraction_static=0.84 this split
+# boots and functions correctly but stops at 572608 tokens, only 17216 below
+# the exact 3x196608 target. Keep the partition fixed and recover that final
+# budget from static slack instead of pushing another target layer onto PP2.
 export PARTITION="${PARTITION:-22,28,14}"
-export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
+# 0.855 reclaims roughly 0.22 GiB of the ~15 GiB pre-load slack versus 0.84.
+# The exact token cap below prevents that extra budget from growing the pool
+# beyond 3x196608; it is only enough to let the remaining PP-local bottleneck
+# reach the requested capacity while preserving PP2 post-pool workspace.
+export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.855}"
 # Exact 3 x 196608 target. Keep the old extra 4096-token reserve disabled while
 # validating the native MTP capacity and post-pool backend headroom.
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-589824}"
