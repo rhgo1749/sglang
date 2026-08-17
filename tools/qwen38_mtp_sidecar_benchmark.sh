@@ -66,7 +66,15 @@ prompt = int(meta.get("prompt_tokens") or requested_prompt)
 completion = int(meta.get("completion_tokens") or 0)
 
 log = open(log_path, errors="replace").read()
-accepts = [int(x) for x in re.findall(r"MTP-CUTOVER-EXTEND\].*?accept=(\d+)", log)]
+
+# Cutover logs are batch-aware now: accept=[1, 2] for bs>1 and accept=[3] for bs=1.
+# Keep compatibility with the older scalar accept=3 format as well.
+accepts = []
+for raw in re.findall(r"MTP-CUTOVER-EXTEND\].*?accept=(\[[^\]]*\]|\d+)", log):
+    if raw.startswith("["):
+        accepts.extend(int(x) for x in re.findall(r"\d+", raw))
+    else:
+        accepts.append(int(raw))
 proposals = re.findall(r"MTP-CUTOVER-DRAFT\].*?proposal=(\[\[.*?\]\])", log)
 
 print(f"prompt_tokens={prompt}")
@@ -87,9 +95,9 @@ else:
     print("verify_iterations=0")
 print(f"draft_log_entries={len(proposals)}")
 
-# SGLang's final decode log is useful because it excludes most prefill cost.
+# SGLang logging changed from "accept length" to "accept len" in this image.
 decode = re.findall(
-    r"Decode batch.*?gen throughput \(token/s\): ([0-9.]+).*?accept length: ([0-9.]+)",
+    r"Decode batch.*?gen throughput \(token/s\): ([0-9.]+).*?accept (?:len|length): ([0-9.]+)",
     log,
 )
 if decode:
