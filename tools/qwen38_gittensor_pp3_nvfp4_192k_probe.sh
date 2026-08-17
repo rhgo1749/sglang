@@ -60,9 +60,9 @@ bash "$ROOT_DIR/qwen38_failfast_watch.sh" \
   bash "$ROOT_DIR/qwen38_vanilla_pp3_nvfp4_final_gate.sh"
 
 echo
-echo '=== MTP PP POOL PROFILE ==='
+echo '=== MTP PP CAPACITY PROFILE ==='
 docker logs "$CONTAINER" 2>&1 | \
-  grep -E '\[MTP-PP-POOL-PROFILE\]' || true
+  grep -E '\[MTP-PP-CAPACITY-(LOCAL|GLOBAL)\]' || true
 
 echo
 echo '=== MTP PHYSICAL MEMORY AUDIT ==='
