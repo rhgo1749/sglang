@@ -173,10 +173,9 @@ def _mtp_sidecar_parallel_context(tp_group):
             # The target may be forced to page_size=64 by TRTLLM-MHA/NVFP4.
             # CUDA2 owns an independent FlashInfer KV pool and the cutover
             # helpers allocate exact token spans (including 3/4-token draft
-            # tails), so keep the sidecar on the token allocator (page_size=1).
-            # Otherwise PagedTokenToKVPoolAllocator.alloc() floors non-page-
-            # aligned sizes and silently returns too few slots.
-            get_schedule().override(page_size=1),
+            # tails), so keep the sidecar on a TRTLLM-compatible paged allocator (page_size=64).
+            # Arbitrary speculative spans are handled by the high-water alloc_extend path below.
+            get_schedule().override(page_size=64),
             get_parallel().override(
                 tp_size=1,
                 tp_rank=_rank,
@@ -234,6 +233,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._mtp_side_draft_input = None
         self._mtp_side_reqs = {}
         self._mtp_side_seq_lens = {}
+        self._mtp_side_alloc_lens = {}
         self._mtp_side_target_refs = {}
         # Temporary draft KV belongs to the current synchronous batch, not a req.
         self._mtp_side_last_draft_slots = None
@@ -323,9 +323,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
                 mr = self.draft_runner
-                if int(getattr(mr, "page_size", -1)) != 1:
+                if int(getattr(mr, "page_size", -1)) != 64:
                     raise RuntimeError(
-                        "CUDA2 MTP sidecar must use page_size=1; got "
+                        "CUDA2 MTP sidecar must use page_size=64; got "
                         f"{getattr(mr, 'page_size', None)} with "
                         f"allocator={type(mr.token_to_kv_pool_allocator).__name__}"
                     )
@@ -334,6 +334,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.gpu_id,
                     int(mr.page_size),
                     type(mr.token_to_kv_pool_allocator).__name__,
+                )
+                logger.info(
+                    "[MTP-CUTOVER-PAGED] CUDA%d page_size=%d high-water allocator enabled",
+                    self.gpu_id,
+                    int(mr.page_size),
                 )
                 logger.info(
                     "[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s",
@@ -924,10 +929,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if target_ref is None or not target_ref.finished():
                 continue
 
-            seq_len = int(self._mtp_side_seq_lens.get(rid, 0))
+            alloc_len = int(self._mtp_side_alloc_lens.get(rid, 0))
             row = req.req_pool_idx
-            if row is not None and seq_len > 0:
-                locs = self.req_to_token_pool.req_to_token[row, :seq_len].clone()
+            if row is not None and alloc_len > 0:
+                locs = self.req_to_token_pool.req_to_token[row, :alloc_len].clone()
                 locs = locs[locs > 0]
                 if locs.numel() > 0:
                     self.token_to_kv_pool_allocator.free(locs)
@@ -941,6 +946,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             self._mtp_side_reqs.pop(rid, None)
             self._mtp_side_seq_lens.pop(rid, None)
+            self._mtp_side_alloc_lens.pop(rid, None)
             self._mtp_side_target_refs.pop(rid, None)
             logger.info("[MTP-CUTOVER-REQ] CUDA%d rid=%s released", self.gpu_id, rid)
 
@@ -987,6 +993,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._mtp_side_reqs[target_req.rid] = req
         self._mtp_side_seq_lens[target_req.rid] = 0
+        self._mtp_side_alloc_lens[target_req.rid] = 0
         self._mtp_side_target_refs[target_req.rid] = target_req
         logger.info(
             "[MTP-CUTOVER-REQ] CUDA%d rid=%s row=%d allocated active=%d",
@@ -1047,6 +1054,111 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             side_batch._collect_deferred_mamba_cow_and_clear(side_reqs)
         return side_batch
 
+    def _mtp_authoritative_reserve_span(
+        self, side_reqs, start_lens, end_lens, *, label
+    ):
+        """Return KV slots for [start,end), growing each request's paged high-water.
+
+        For page_size>1, speculative slots may share a page with committed KV.  Such
+        tails must not be individually freed: PagedTokenToKVPoolAllocator.free()
+        returns whole pages.  Keep a per-request allocation high-water instead and
+        reuse/overwrite speculative tail slots until the request is released.
+        """
+        if not (len(side_reqs) == len(start_lens) == len(end_lens)):
+            raise RuntimeError(
+                f"CUDA2 MTP {label} span batch mismatch: "
+                f"reqs={len(side_reqs)} start={len(start_lens)} end={len(end_lens)}"
+            )
+
+        alloc_lens = [
+            int(self._mtp_side_alloc_lens.get(req.rid, 0)) for req in side_reqs
+        ]
+        for req, start, end, alloc_len in zip(
+            side_reqs, start_lens, end_lens, alloc_lens
+        ):
+            if start < 0 or end < start:
+                raise RuntimeError(
+                    f"CUDA2 MTP {label} invalid span rid={req.rid}: "
+                    f"start={start} end={end}"
+                )
+            if start > alloc_len:
+                raise RuntimeError(
+                    f"CUDA2 MTP {label} allocation hole rid={req.rid}: "
+                    f"start={start} alloc={alloc_len}"
+                )
+
+        grow_to = [max(a, int(e)) for a, e in zip(alloc_lens, end_lens)]
+        grow_lens = [b - a for a, b in zip(alloc_lens, grow_to)]
+        total_grow = int(sum(grow_lens))
+        allocator = self.token_to_kv_pool_allocator
+
+        if total_grow > 0:
+            if int(getattr(allocator, "page_size", 1)) == 1:
+                new_slots = allocator.alloc(total_grow)
+            else:
+                prefix_cpu = torch.tensor(alloc_lens, dtype=torch.int64)
+                seq_cpu = torch.tensor(grow_to, dtype=torch.int64)
+                prefix_dev = prefix_cpu.to(self.device)
+                seq_dev = seq_cpu.to(self.device)
+                last = []
+                for req, alloc_len in zip(side_reqs, alloc_lens):
+                    if alloc_len > 0:
+                        last.append(
+                            self.req_to_token_pool.req_to_token[
+                                req.req_pool_idx, alloc_len - 1 : alloc_len
+                            ]
+                        )
+                    else:
+                        last.append(
+                            torch.full(
+                                (1,), -1, dtype=torch.int64, device=self.device
+                            )
+                        )
+                new_slots = allocator.alloc_extend(
+                    prefix_dev,
+                    prefix_cpu,
+                    seq_dev,
+                    seq_cpu,
+                    torch.cat(last),
+                    total_grow,
+                )
+
+            if new_slots is None:
+                raise RuntimeError(
+                    f"CUDA2 MTP {label} KV allocation failed: need={total_grow} "
+                    f"page_size={getattr(allocator, 'page_size', None)}"
+                )
+
+            off = 0
+            for req, old_alloc, new_alloc, grow in zip(
+                side_reqs, alloc_lens, grow_to, grow_lens
+            ):
+                if grow:
+                    self.req_to_token_pool.write(
+                        (req.req_pool_idx, slice(old_alloc, new_alloc)),
+                        new_slots[off : off + grow],
+                    )
+                    off += grow
+                self._mtp_side_alloc_lens[req.rid] = new_alloc
+
+        pieces = []
+        for req, start, end in zip(side_reqs, start_lens, end_lens):
+            if end > start:
+                pieces.append(
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, start:end
+                    ].clone()
+                )
+        if not pieces:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        out = torch.cat(pieces)
+        expected = int(sum(e - s for s, e in zip(start_lens, end_lens)))
+        if int(out.numel()) != expected:
+            raise RuntimeError(
+                f"CUDA2 MTP {label} span size mismatch: {out.numel()} != {expected}"
+            )
+        return out
+
     def mtp_authoritative_prefill(
         self,
         target_batch,
@@ -1083,21 +1195,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
             total_extend = int(sum(extend_lens))
-            slots = self.token_to_kv_pool_allocator.alloc(total_extend)
-            if slots is None:
-                raise RuntimeError(
-                    f"CUDA2 MTP prefill KV allocation failed: need={total_extend}"
-                )
-            off = 0
-            for side_req, old_len, seq_len, extend_len in zip(
-                side_reqs, old_lens, seq_lens, extend_lens
-            ):
-                if extend_len:
-                    self.req_to_token_pool.write(
-                        (side_req.req_pool_idx, slice(old_len, seq_len)),
-                        slots[off : off + extend_len],
-                    )
-                off += extend_len
+            slots = self._mtp_authoritative_reserve_span(
+                side_reqs, old_lens, seq_lens, label="prefill"
+            )
 
             side_batch = self._mtp_authoritative_make_batch(target_batch, seq_lens)
             side_batch.prefix_lens = old_lens
@@ -1153,23 +1253,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             seq_lens = [int(self._mtp_side_seq_lens[r.rid]) for r in target_batch.reqs]
             side_input = self._mtp_authoritative_to_side_draft_input(target_batch.spec_info)
 
-            future = self.token_to_kv_pool_allocator.alloc(bs * self.speculative_num_steps)
-            if future is None:
-                raise RuntimeError(
-                    "CUDA2 MTP speculative KV reservation failed: "
-                    f"need={bs * self.speculative_num_steps}"
-                )
-            off = 0
-            for side_req, seq_len in zip(side_reqs, seq_lens):
-                req_future = future[off : off + self.speculative_num_steps]
-                self.req_to_token_pool.write(
-                    (
-                        side_req.req_pool_idx,
-                        slice(seq_len, seq_len + self.speculative_num_steps),
-                    ),
-                    req_future,
-                )
-                off += self.speculative_num_steps
+            future = self._mtp_authoritative_reserve_span(
+                side_reqs,
+                seq_lens,
+                [x + self.speculative_num_steps for x in seq_lens],
+                label="draft",
+            )
             self._mtp_side_last_draft_slots = future
 
             side_batch = self._mtp_authoritative_make_batch(target_batch, seq_lens)
@@ -1227,23 +1316,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             torch.cuda.set_device(self.gpu_id)
             side_reqs = [self._mtp_authoritative_get_req(r) for r in target_batch.reqs]
 
-            # Draft-decode's temporary KV is no longer needed after target verify.
-            if self._mtp_side_last_draft_slots is not None:
-                self.token_to_kv_pool_allocator.free(self._mtp_side_last_draft_slots)
-                self._mtp_side_last_draft_slots = None
+            # Paged speculative tails can share a page with committed KV, so never
+            # free the temporary 3-token draft span independently.  Reuse it via
+            # the per-request high-water and grow only when the 4-token extend crosses it.
+            self._mtp_side_last_draft_slots = None
 
             width = self.speculative_num_draft_tokens
-            extend_slots = self.token_to_kv_pool_allocator.alloc(bs * width)
-            if extend_slots is None:
-                raise RuntimeError(
-                    f"CUDA2 MTP draft-extend KV allocation failed: need={bs * width}"
-                )
+            extend_slots = self._mtp_authoritative_reserve_span(
+                side_reqs,
+                old_lens,
+                [x + width for x in old_lens],
+                label="draft-extend",
+            )
             slot_rows = extend_slots.view(bs, width)
-            for side_req, old_len, row_slots in zip(side_reqs, old_lens, slot_rows):
-                self.req_to_token_pool.write(
-                    (side_req.req_pool_idx, slice(old_len, old_len + width)),
-                    row_slots,
-                )
 
             side_batch = self._mtp_authoritative_make_batch(target_batch, old_lens)
             side_batch.out_cache_loc = extend_slots
@@ -1275,21 +1360,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self._draft_extend_for_decode(side_batch, side_result)
                 torch.cuda.synchronize(self.gpu_id)
 
-            free_parts = []
             new_lens = []
-            for target_req, side_req, old_len, accepted, row_slots in zip(
-                target_batch.reqs, side_reqs, old_lens, accept_cpu, slot_rows
+            for target_req, side_req, old_len, accepted in zip(
+                target_batch.reqs, side_reqs, old_lens, accept_cpu
             ):
-                if accepted < width:
-                    free_parts.append(row_slots[accepted:])
                 new_len = old_len + accepted
                 new_lens.append(new_len)
                 side_req.kv_committed_len = new_len
                 self._mtp_side_seq_lens[target_req.rid] = new_len
-            if free_parts:
-                tail = torch.cat([x for x in free_parts if x.numel() > 0])
-                if tail.numel() > 0:
-                    self.token_to_kv_pool_allocator.free(tail)
 
             logger.info(
                 "[MTP-CUTOVER-EXTEND] CUDA%d bs=%d old=%s accept=%s new=%s",
@@ -2604,7 +2682,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # that still reads server_args.page_size agrees with the scoped
                 # schedule bag used while the sidecar is built/run.
                 _side_server_args = _mtp_copy.copy(server_args)
-                object.__setattr__(_side_server_args, "page_size", 1)
+                object.__setattr__(_side_server_args, "page_size", 64)
                 if getattr(server_args, "kv_cache_dtype", None) == "nvfp4":
                     object.__setattr__(
                         _side_server_args, "kv_cache_dtype", "nvfp4"
