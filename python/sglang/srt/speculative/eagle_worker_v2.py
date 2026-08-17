@@ -707,6 +707,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
+        _side_proposal = getattr(
+            self, "_mtp_sidecar_multistep_proposal", None
+        )
+        if _side_proposal is not None:
+            try:
+                _stock_proposal = draft_tokens.detach().to("cpu")
+                _same_shape = tuple(_side_proposal.shape) == tuple(_stock_proposal.shape)
+                _exact = bool(
+                    _same_shape and torch.equal(_side_proposal, _stock_proposal)
+                )
+                _matches = (
+                    int((_side_proposal == _stock_proposal).sum().item())
+                    if _same_shape
+                    else -1
+                )
+                logger.info(
+                    "[MTP-SIDECAR-PROPOSAL] side=%s stock=%s shape_match=%s "
+                    "token_matches=%d/%d exact=%s",
+                    _side_proposal.tolist(),
+                    _stock_proposal.tolist(),
+                    _same_shape,
+                    _matches,
+                    _stock_proposal.numel(),
+                    _exact,
+                )
+            finally:
+                self._mtp_sidecar_multistep_proposal = None
+
         return build_eagle_verify_input(
             batch,
             draft_input,
@@ -1288,6 +1316,123 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     side_logits.next_token_logits[-1],
                     dim=-1,
                 ).item()
+            )
+
+            # Exercise the real TOPK=1 EAGLE multi-step chain on CUDA2 before
+            # the stock draft runs.  Reserve the sidecar's future draft KV slots
+            # explicitly: prepare_for_draft() reads them from req_to_token at
+            # [seq_len : seq_len + topk*num_steps].  The scheduler normally
+            # pre-populates those slots for the colocated draft; our independent
+            # sidecar pool must do that itself.
+            if self.topk != 1:
+                raise RuntimeError(
+                    f"CUDA2 multistep shadow currently requires topk=1, got {self.topk}"
+                )
+
+            _num_steps = int(self.speculative_num_steps)
+            _future_slots = side_kv_alloc.alloc(_num_steps)
+            if _future_slots is None:
+                raise RuntimeError(
+                    f"CUDA2 sidecar draft KV reservation failed: need={_num_steps}"
+                )
+            side_req_pool.write(
+                (side_req_idx, slice(seq_len, seq_len + _num_steps)),
+                _future_slots,
+            )
+
+            _side_initial_token = torch.argmax(
+                side_logits.next_token_logits, dim=-1, keepdim=True
+            ).to(torch.int64)
+            _side_draft_input = EagleDraftInput(
+                topk_p=torch.ones_like(_side_initial_token, dtype=torch.float32),
+                topk_index=_side_initial_token,
+                draft_probs=None,
+                hidden_states=side_logits.hidden_states,
+                bonus_tokens=_to_sidecar(next_token_ids),
+                num_tokens_per_req=1,
+                num_tokens_for_logprob_per_req=1,
+            )
+
+            # prepare_for_draft mutates the ScheduleBatch view only.  Reuse the
+            # already-isolated side_batch, whose request row and pools belong to
+            # CUDA2, and create a sidecar-specific multi-step attention backend
+            # once.  Do not borrow the colocated draft backend: it owns CUDA0
+            # buffers and TP2 construction state.
+            side_batch.spec_info = _side_draft_input
+            side_batch.forward_mode = batch.forward_mode
+            side_batch.seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
+            side_batch.seq_lens = side_batch.seq_lens_cpu.to(sidecar_device)
+            side_batch.seq_lens_sum = seq_len
+
+            with (
+                _mtp_sidecar_parallel_context(get_self_pp_group()),
+                draft_pp_context(),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                if not hasattr(self, "_mtp_sidecar_draft_attn_backend"):
+                    _side_factory = DraftBackendFactory(
+                        self.server_args,
+                        mr,
+                        self.topk,
+                        self.speculative_num_steps,
+                        seed_dsa_topk_from_draft_extend=False,
+                    )
+                    self._mtp_sidecar_draft_attn_backend = (
+                        _side_factory.create_decode_backend()
+                    )
+
+                _side_fb, _ = prepare_for_draft(
+                    _side_draft_input,
+                    side_req_pool,
+                    side_batch,
+                    None,
+                    mr,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+                _side_fb.return_logprob = False
+                _side_attn = self._mtp_sidecar_draft_attn_backend
+                if self.speculative_num_steps > 1:
+                    _side_attn.init_forward_metadata(_side_fb)
+                    _side_fb.mark_forward_metadata_ready()
+
+                _out_cache = per_step_draft_out_cache_loc(
+                    _side_fb.out_cache_loc,
+                    _side_fb.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )
+                _cur_token = _side_initial_token
+                _cur_hidden = side_logits.hidden_states
+                _proposal = [_cur_token.reshape(-1)]
+
+                # num_steps=3 means two actual MTP forwards after the initial
+                # token from prefill logits.  This mirrors draft_forward's
+                # topk1 fast path without touching the stock worker's state.
+                for _i in range(self.speculative_num_steps - 1):
+                    _side_fb.input_ids = _cur_token.reshape(-1)
+                    _side_fb.out_cache_loc = _out_cache[_i]
+                    _side_fb.spec_info.hidden_states = _cur_hidden
+                    with forward_context(
+                        ForwardContext(attn_backend=_side_attn.attn_backends[_i])
+                    ):
+                        _step_logits = mr.forward(_side_fb).logits_output
+                    torch.cuda.synchronize(sidecar_gpu_id)
+                    _cur_token = torch.argmax(
+                        _step_logits.next_token_logits, dim=-1, keepdim=True
+                    ).to(torch.int64)
+                    _proposal.append(_cur_token.reshape(-1))
+                    _cur_hidden = _step_logits.hidden_states
+                    _side_fb.positions.add_(1)
+
+            self._mtp_sidecar_multistep_proposal = (
+                torch.stack(_proposal, dim=1).detach().cpu()
+            )
+            logger.info(
+                "[MTP-SIDECAR-MULTISTEP] CUDA%d proposal=%s",
+                sidecar_gpu_id,
+                self._mtp_sidecar_multistep_proposal.tolist(),
             )
 
             # Save a tiny one-shot correctness snapshot on host memory.  The
