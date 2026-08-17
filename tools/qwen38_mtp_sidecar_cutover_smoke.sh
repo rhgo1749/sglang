@@ -7,7 +7,7 @@ CONTAINER="sglang-qwen38-test"
 IMAGE="lmsysorg/sglang:qwen38-27b"
 MODEL="RadixArk/Qwen3.8-27B-NVFP4"
 # With the colocated draft removed, 0.95 lets the target KV pool consume nearly
-# all reclaimed VRAM before the target-verify CUDA graph is captured.  Keep a
+# all reclaimed VRAM before the target-verify CUDA graph is captured. Keep a
 # conservative graph/eager workspace reserve for the authoritative cutover gate.
 # The runtime cutover itself still fail-fast checks target/sidecar pools >=64K.
 MEM_FRACTION_STATIC="${MTP_CUTOVER_MEM_FRACTION_STATIC:-0.80}"
@@ -61,6 +61,17 @@ docker run -d \
 STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$CONTAINER")"
 echo "StartedAt: $STARTED"
 
+dump_runtime_failure() {
+  echo '=== REQUEST FAILURE CUTOVER SUMMARY ==='
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
+    grep -E 'MTP-CUTOVER|MTP-SIDECAR|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|Exception|RuntimeError|AssertionError|CUDA error|illegal memory|out of memory' | \
+    tail -320 || true
+  echo '=== REQUEST FAILURE TAIL ==='
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -260 || true
+  echo '=== CONTAINER STATUS ==='
+  docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER" || true
+}
+
 echo '=== WAIT FOR SERVER ==='
 if ! timeout 180 bash -c '
 while true; do
@@ -89,7 +100,9 @@ docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
   tail -220 || true
 
 echo '=== MULTI-ITERATION DECODE ==='
-curl -fsS \
+SHORT_HTTP="$(curl -sS \
+  -o /tmp/qwen38-cutover-short.json \
+  -w '%{http_code}' \
   http://127.0.0.1:30000/generate \
   -H 'Content-Type: application/json' \
   -d '{
@@ -98,7 +111,15 @@ curl -fsS \
       "temperature": 0,
       "max_new_tokens": 64
     }
-  }' > /tmp/qwen38-cutover-short.json
+  }' || true)"
+echo "short_http=${SHORT_HTTP}"
+if [[ "$SHORT_HTTP" != "200" ]]; then
+  echo '=== SHORT RESPONSE BODY ==='
+  cat /tmp/qwen38-cutover-short.json 2>/dev/null || true
+  echo
+  dump_runtime_failure
+  exit 1
+fi
 python3 - <<'PY'
 import json
 p='/tmp/qwen38-cutover-short.json'
@@ -124,12 +145,33 @@ with open('/tmp/qwen38-cutover-64k.json','w') as f:
     json.dump(payload,f,separators=(',',':'))
 PY
 
+set +e
 /usr/bin/time -f '64k_wall=%e sec' \
-  curl -fsS \
+  curl -sS \
+    -o /tmp/qwen38-cutover-64k-response.json \
+    -w '64k_http=%{http_code}\n' \
     http://127.0.0.1:30000/generate \
     -H 'Content-Type: application/json' \
-    --data-binary @/tmp/qwen38-cutover-64k.json \
-    > /tmp/qwen38-cutover-64k-response.json
+    --data-binary @/tmp/qwen38-cutover-64k.json
+CURL64_RC=$?
+set -e
+if [[ $CURL64_RC -ne 0 ]] || ! python3 - <<'PY'
+import json, sys
+p='/tmp/qwen38-cutover-64k-response.json'
+try:
+    d=json.load(open(p))
+except Exception:
+    sys.exit(1)
+if isinstance(d, dict) and (d.get('error') is not None or d.get('detail') is not None):
+    sys.exit(1)
+PY
+then
+  echo '=== 64K RESPONSE BODY ==='
+  cat /tmp/qwen38-cutover-64k-response.json 2>/dev/null || true
+  echo
+  dump_runtime_failure
+  exit 1
+fi
 
 python3 - <<'PY'
 import json
