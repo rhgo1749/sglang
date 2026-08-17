@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Long-context follow-up for qwen38_vanilla_pp3_nvfp4_final_gate.sh.
-# Assumes the validated server is already running with:
-#   PP=19,23,22 / NVFP4 KV / 262144 ctx / max_running_requests=3
-# This script does not restart or mutate the server.
+# Assumes a validated PP3/NVFP4 server is already running.  The concrete
+# partition/context/MTP profile comes from the caller environment; this script
+# does not restart or mutate the server.
 
 PORT="${PORT:-30000}"
 CONTAINER="${CONTAINER:-sglang-qwen38-vanilla-pp3-final}"
@@ -37,7 +37,7 @@ if ! curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/model_info" >/dev/null; th
 fi
 
 echo '============================================================'
-echo ' QWEN3.8 VANILLA PP3 + NVFP4 REAL LONG-CONTEXT STRESS GATE'
+echo ' QWEN3.8 PP3 + NVFP4 REAL LONG-CONTEXT STRESS GATE'
 echo " port=${PORT}"
 echo " container=${CONTAINER}"
 echo " context_length=${CONTEXT_LENGTH}"
@@ -45,7 +45,6 @@ echo " stages=${STAGES}"
 echo " parallel=${PARALLEL}"
 echo " decode_tokens=${DECODE_TOKENS}"
 echo " request_timeout=${REQUEST_TIMEOUT}s"
-echo ' expected baseline: PP=19,23,22 / 3x262144 capacity already PASS'
 echo '============================================================'
 
 rm -rf "$ROOT"
@@ -223,6 +222,7 @@ done
 echo
 echo '============================================================'
 echo ' REAL 3-SESSION LONG-CONTEXT STRESS RESULT: PASS'
-echo ' 3x64K -> 3x128K -> 3x192K -> 3x258048 all completed'
+echo " completed_stages=${STAGES}"
+echo " context_length=${CONTEXT_LENGTH} parallel=${PARALLEL} decode_tokens=${DECODE_TOKENS}"
 echo '============================================================'
 echo 'QWEN38_PP3_NVFP4_REAL_LONG_STRESS_GATE=PASS'
