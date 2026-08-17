@@ -29,7 +29,7 @@ for py in "${HOTFIX_PY[@]}"; do
 done
 echo 'hotfix syntax: OK'
 
-echo '=== PREFLIGHT EXACT IMAGE NVFP4 TARGET ABI ==='
+echo '=== PREFLIGHT EXACT IMAGE NVFP4 TARGET+DRAFT ABI ==='
 HELP_OUT="$(mktemp)"
 if ! docker run --rm "$IMAGE" python3 -m sglang.launch_server --help >"$HELP_OUT" 2>&1; then
   cat "$HELP_OUT"
@@ -47,8 +47,12 @@ if ! grep -q 'nvfp4' "$HELP_OUT" || ! grep -q 'trtllm_mha' "$HELP_OUT"; then
   grep -E -- 'kv-cache-dtype|attention-backend|trtllm_mha|nvfp4' "$HELP_OUT" | head -100 || true
   exit 1
 fi
+if ! docker run --rm "$IMAGE" python3 -c 'from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnMultiStepDraftBackend; print("TRTLLM MHA multistep draft: OK")'; then
+  echo 'ERROR: exact image lacks TRTLLMHAAttnMultiStepDraftBackend'
+  exit 1
+fi
 echo 'target: NVFP4 KV (FlashInfer prefill + TRTLLM-MHA decode, page_size=64)'
-echo 'CUDA2 draft: BF16 KV (FlashInfer multi-step, private page_size=1)'
+echo 'CUDA2 draft: NVFP4 KV (FlashInfer extend + TRTLLM-MHA multi-step decode, private page_size=1)'
 
 echo '=== APPLY AUTHORITATIVE CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
@@ -61,13 +65,13 @@ python3 tools/qwen38_mtp_cutover_parallel3_hotfix.py --commit
 echo '=== HOTFIX PARALLEL POOL GATE ==='
 python3 tools/qwen38_mtp_cutover_pool_gate_hotfix.py --commit
 
-echo '=== HOTFIX NVFP4 TARGET / BF16 CUDA2 DRAFT ==='
+echo '=== HOTFIX NVFP4 TARGET / NVFP4 CUDA2 DRAFT ==='
 python3 tools/qwen38_mtp_cutover_nvfp4_target_hotfix.py --commit
 
 echo '=== HOTFIX CUDA2 SIDECAR PAGE_SIZE=1 ==='
 python3 tools/qwen38_mtp_cutover_sidecar_page1_hotfix.py --commit
 
-echo '=== RECREATE SERVER: NVFP4 TARGET KV, BF16 DRAFT KV, LOGICAL 256K x 3 ==='
+echo '=== RECREATE SERVER: NVFP4 TARGET KV, NVFP4 DRAFT KV, LOGICAL 256K x 3 ==='
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d \
@@ -91,7 +95,6 @@ docker run -d \
     --attention-backend flashinfer \
     --prefill-attention-backend flashinfer \
     --decode-attention-backend trtllm_mha \
-    --speculative-draft-attention-backend flashinfer \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --max-running-requests "$MAX_RUNNING" \
     --max-mamba-cache-size "$MAX_MAMBA" \
@@ -116,7 +119,7 @@ echo "StartedAt: $STARTED"
 dump_failure() {
   echo '=== FAILURE SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory|NCCL|Connection closed' | \
+    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory|NCCL|Connection closed|Missing TRTLLM' | \
     tail -620 || true
   echo '=== FAILURE TAIL ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -420 || true
@@ -139,20 +142,25 @@ fi
 echo '=== STARTUP GATES ==='
 START_LOG="$(mktemp)"
 docker logs --since "$STARTED" "$CONTAINER" >"$START_LOG" 2>&1 || true
-grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -420 || true
+grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -460 || true
 
-if ! grep -q '\[MTP-CUTOVER-KV\] target=nvfp4 CUDA2 draft=bfloat16' "$START_LOG"; then
-  echo 'ERROR: CUDA2 private BF16 draft-KV override did not activate'
+if ! grep -q '\[MTP-CUTOVER-KV\] target=nvfp4 CUDA2 draft=nvfp4' "$START_LOG"; then
+  echo 'ERROR: CUDA2 private NVFP4 draft-KV override did not activate'
   dump_failure
   exit 1
 fi
-if ! grep -q 'draft_kv_dtype=torch.bfloat16' "$START_LOG"; then
-  echo 'ERROR: CUDA2 draft runner did not resolve BF16 KV'
+if ! grep -Eq 'draft_kv_dtype=torch\.float4_e2m1fn_x2.*draft_kv_tag=nvfp4' "$START_LOG"; then
+  echo 'ERROR: CUDA2 draft runner did not resolve NVFP4 KV'
   dump_failure
   exit 1
 fi
 if ! grep -Eq '\[MTP-CUTOVER-PAGE\].*draft_page_size=1.*allocator=.*TokenToKVPoolAllocator' "$START_LOG"; then
   echo 'ERROR: CUDA2 draft did not isolate to page_size=1 token allocator'
+  dump_failure
+  exit 1
+fi
+if ! grep -Eq '\[MTP-CUTOVER-ATTN\].*decode=TRTLLMHAAttnMultiStepDraftBackend.*extend=FlashInferAttnBackend' "$START_LOG"; then
+  echo 'ERROR: CUDA2 draft did not resolve TRTLLM-MHA decode + FlashInfer extend split'
   dump_failure
   exit 1
 fi
@@ -164,7 +172,7 @@ if [[ -z "$TARGET_TOKENS" || -z "$SIDE_TOKENS" ]]; then
   dump_failure
   exit 1
 fi
-printf 'target_kv=nvfp4\ntarget_page_size=64\ndraft_kv=bfloat16\ndraft_page_size=1\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
+printf 'target_kv=nvfp4\ntarget_page_size=64\ndraft_kv=nvfp4\ndraft_page_size=1\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
   "$TARGET_TOKENS" "$SIDE_TOKENS" "$MAX_RUNNING"
 
 POOL_MIN="$TARGET_TOKENS"
@@ -259,9 +267,9 @@ if [[ $RC -ne 0 || $PY_RC -ne 0 ]]; then
 fi
 
 echo '=== PARALLEL CUTOVER LOG ==='
-grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND|KV|PAGE)|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|CUDA error|illegal memory|out of memory' "$REQ_LOG" | tail -520 || true
+grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND|KV|PAGE|ATTN)|Prefill batch|Decode batch|Scheduler hit an exception|Traceback|CUDA error|illegal memory|out of memory' "$REQ_LOG" | tail -520 || true
 
 echo '=== CONTAINER STATUS ==='
 docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER"
 
-echo 'MTP NVFP4-TARGET / BF16-DRAFT PARALLEL-3 SMOKE COMPLETE'
+echo 'MTP NVFP4-TARGET / NVFP4-DRAFT PARALLEL-3 SMOKE COMPLETE'
