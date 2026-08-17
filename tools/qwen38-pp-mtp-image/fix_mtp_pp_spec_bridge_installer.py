@@ -10,7 +10,7 @@ if needle not in s:
 s = s.replace(needle, replacement, 1)
 
 # patch_mtp_pp_spec_bridge.py contains the generated _pp_prep_batch_result body
-# inside a Python triple-quoted string.  Search the PATCH SOURCE representation
+# inside a Python triple-quoted string. Search the PATCH SOURCE representation
 # (literal backslash-n sequences), not the generated target representation.
 future_old = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
 future_new = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
@@ -45,7 +45,11 @@ if "pp_proxy_tensors=pp_proxy_tensors" not in _vf:
     raise RuntimeError("EAGLEWorkerV2.verify did not forward pp_proxy_tensors")
 
 _p = PP.read_text()
-_future_guard = '''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n'''
+_future_guard = (
+    '        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n'
+    '        if batch.spec_algorithm.is_none():\n'
+    '            self.future_map.stash(\n'
+)
 if _future_guard not in _p:
     raise RuntimeError("sync PP spec still writes unconditionally into FutureMap")
 
@@ -54,4 +58,4 @@ print("VERIFIED sync PP spec bypasses FutureMap token stash")
 '''
 
 P.write_text(s)
-print("FIXED bridge installer source escaping, offsets, FutureMap routing, and semantic audits")
+print("FIXED bridge installer syntax, source escaping, offsets, FutureMap routing, and semantic audits")
