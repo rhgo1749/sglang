@@ -356,10 +356,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         _side_pool.mamba_ping_pong_track_buffer_size,
                         _side_pool.mamba_pool.size,
                     )
-                if int(mr.max_total_num_tokens) < 65536:
+                import os as _mtp_os
+                _mtp_default_min_pool = (
+                    32768
+                    if int(get_schedule().max_running_requests or 1) > 1
+                    else 65536
+                )
+                _mtp_min_pool_tokens = int(
+                    _mtp_os.environ.get(
+                        "SGLANG_MTP_CUTOVER_MIN_POOL_TOKENS",
+                        str(_mtp_default_min_pool),
+                    )
+                )
+                if int(mr.max_total_num_tokens) < _mtp_min_pool_tokens:
                     raise RuntimeError(
                         f"CUDA2 MTP pool too small for cutover: "
-                        f"{mr.max_total_num_tokens} < 65536"
+                        f"{mr.max_total_num_tokens} < {_mtp_min_pool_tokens}"
                     )
                 free_b, total_b = torch.cuda.mem_get_info(self.gpu_id)
                 logger.info(
@@ -2600,10 +2612,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         if self._mtp_sidecar_authoritative:
             target_tokens = int(self.target_worker.model_runner.max_total_num_tokens)
-            if target_tokens < 65536:
+            import os as _mtp_os
+            _mtp_default_min_pool = (
+                32768
+                if int(get_schedule().max_running_requests or 1) > 1
+                else 65536
+            )
+            _mtp_min_pool_tokens = int(
+                _mtp_os.environ.get(
+                    "SGLANG_MTP_CUTOVER_MIN_POOL_TOKENS",
+                    str(_mtp_default_min_pool),
+                )
+            )
+            if target_tokens < _mtp_min_pool_tokens:
                 raise RuntimeError(
                     f"MTP cutover target KV pool too small: "
-                    f"{target_tokens} < 65536"
+                    f"{target_tokens} < {_mtp_min_pool_tokens}"
                 )
             side_tokens = (
                 int(self._draft_worker.draft_runner.max_total_num_tokens)
