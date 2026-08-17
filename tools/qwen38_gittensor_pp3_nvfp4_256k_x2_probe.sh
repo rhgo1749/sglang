@@ -14,13 +14,15 @@ export PARALLEL="${PARALLEL:-2}"
 export MAX_RUNNING="${MAX_RUNNING:-2}"
 export MAX_MAMBA="${MAX_MAMBA:-2}"
 
-# Keep the PP layout already validated by the native MTP bridge. With only two
-# resident sequences the 524288-token pool is materially smaller than the old
-# 3x192K pool, so there is no reason to move target layers back onto PP2.
-export PARTITION="${PARTITION:-22,28,14}"
-# 0.84 already supported >524K tokens with this partition during the 3-way
-# experiments. Returning from 0.855 to 0.84 deliberately restores non-static
-# runtime workspace while the exact 2x256Ki token cap remains reachable.
+# 2x256K reaches the exact 524288-token pool with 22,28,14, but PP2 still
+# OOMs during draft NVFP4 dequantization: a 106 MiB allocation sees only
+# ~100 MiB free around 109K prefill. Move layers 22-23 onto PP0 and layers
+# 50-51 onto PP1, yielding 24,28,12. With full-attention every fourth layer,
+# the target full-attention distribution changes from 5/7/4 to 6/7/3. This
+# removes one full-attention KV layer plus two target layers from PP2 without
+# increasing PP1's full-attention count, preserving the exact 2x256K pool.
+export PARTITION="${PARTITION:-24,28,12}"
+# Keep the validated 2x256K memory policy; this probe changes only PP placement.
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-524288}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-512}"
