@@ -12,6 +12,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_ownership.py /tmp/patch_mtp_pp_owner
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_req_source.py /tmp/patch_mtp_pp_req_source.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_mm_identity.py /tmp/patch_mtp_pp_mm_identity.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_spec_bridge.py /tmp/patch_mtp_pp_spec_bridge.py
+COPY tools/qwen38-pp-mtp-image/fix_mtp_pp_spec_bridge_installer.py /tmp/fix_mtp_pp_spec_bridge_installer.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -20,6 +21,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_ownership.py \
  && python3 /tmp/patch_mtp_pp_req_source.py \
  && python3 /tmp/patch_mtp_pp_mm_identity.py \
+ && python3 /tmp/fix_mtp_pp_spec_bridge_installer.py \
  && python3 /tmp/patch_mtp_pp_spec_bridge.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
@@ -36,4 +38,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_ownership.py \
       /tmp/patch_mtp_pp_req_source.py \
       /tmp/patch_mtp_pp_mm_identity.py \
-      /tmp/patch_mtp_pp_spec_bridge.py
+      /tmp/patch_mtp_pp_spec_bridge.py \
+      /tmp/fix_mtp_pp_spec_bridge_installer.py
