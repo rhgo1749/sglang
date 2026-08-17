@@ -1,39 +1,40 @@
 from pathlib import Path
 
-P = Path("/sgl-workspace/sglang/python/sglang/srt/model_executor/pool_configurator.py")
+P = Path(
+    "/sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py"
+)
 s = P.read_text()
 
-# The native PP3 MTP bridge owns the draft worker/KV pool only on PP-last.
-# Upstream DefaultPoolConfigurator prices EAGLE draft KV into every target PP
-# stage, which is correct for colocated speculative workers but becomes a
-# phantom surcharge on PP0/PP1 in this bridge topology.  Keep the surcharge on
-# PP-last only; target KV accounting on non-owner stages must reflect only the
-# target layers physically allocated there.
-old = '''        # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.\n        # Assumes draft and target share the same per-layer KV size (head_dim,\n        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that\n        # reuse the target architecture's attention config.\n        if (\n            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()\n        ) and not kvc.is_draft_worker:\n            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers\n            if (\n                eagle_draft_num_layers is not None\n                and int(eagle_draft_num_layers) > 0\n                and int(num_layers) > 0\n            ):\n                self._cell_size = int(\n                    self._cell_size\n                    * (1 + int(eagle_draft_num_layers) / int(num_layers))\n                )\n'''
+# Diagnostic only.  Each PP rank profiles its own token capacity, then SGLang
+# all-reduces MIN across PP so every stage allocates the same token count.  The
+# public max_total_num_tokens log is therefore the global minimum and hides the
+# local headroom of PP0/PP1.  Log both sides of that reduction so repartition and
+# PP-last MTP memory work can be sized from the real per-stage capacities.
+old = '''        # Sync across PP ranks (each may have different layer counts)\n        if configured_pp_size() > 1:\n            tensor = torch.tensor(token_capacity, dtype=torch.int64)\n            torch.distributed.all_reduce(\n                tensor,\n                op=torch.distributed.ReduceOp.MIN,\n                group=get_world_group().cpu_group,\n            )\n            token_capacity = tensor.item()\n\n        return token_capacity\n'''
 
-new = '''        # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.\n        # Assumes draft and target share the same per-layer KV size (head_dim,\n        # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that\n        # reuse the target architecture's attention config.\n        #\n        # [MTP-PP-POOL-PROFILE] The qwen38 native PP bridge used by this image\n        # owns the only draft worker/KV pool on PP-last.  Charging draft KV to\n        # PP0/PP1 creates a phantom capacity cap despite no draft pool existing\n        # there.  The image is bridge-specific, so only PP-last carries the\n        # speculative KV surcharge when PP is active.\n        _mtp_pp_draft_budget_owner = (\n            kvc.ps.pp_size <= 1 or kvc.ps.pp_rank == kvc.ps.pp_size - 1\n        )\n        if (\n            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()\n        ) and not kvc.is_draft_worker:\n            eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers\n            if (\n                eagle_draft_num_layers is not None\n                and int(eagle_draft_num_layers) > 0\n                and int(num_layers) > 0\n            ):\n                if _mtp_pp_draft_budget_owner:\n                    self._cell_size = int(\n                        self._cell_size\n                        * (1 + int(eagle_draft_num_layers) / int(num_layers))\n                    )\n                    logger.info(\n                        "[MTP-PP-POOL-PROFILE] PP%d owns draft KV budget; "\n                        "layers=%d draft_layers=%d cell_size=%d",\n                        int(kvc.ps.pp_rank),\n                        int(num_layers),\n                        int(eagle_draft_num_layers),\n                        int(self._cell_size),\n                    )\n                else:\n                    logger.info(\n                        "[MTP-PP-POOL-PROFILE] PP%d skips phantom draft KV "\n                        "budget; layers=%d draft_layers=%d cell_size=%d",\n                        int(kvc.ps.pp_rank),\n                        int(num_layers),\n                        int(eagle_draft_num_layers),\n                        int(self._cell_size),\n                    )\n'''
+new = '''        # Sync across PP ranks (each may have different layer counts)\n        if configured_pp_size() > 1:\n            logger.info(\n                "[MTP-PP-CAPACITY-LOCAL] PP%d local_tokens=%d layers=%d:%d "\n                "available_gpu_mem=%.2fGB",\n                int(self.ps.pp_rank),\n                int(token_capacity),\n                int(self.layer_info.start_layer),\n                int(self.layer_info.end_layer),\n                get_available_gpu_memory(self.device, self.gpu_id),\n            )\n            tensor = torch.tensor(token_capacity, dtype=torch.int64)\n            torch.distributed.all_reduce(\n                tensor,\n                op=torch.distributed.ReduceOp.MIN,\n                group=get_world_group().cpu_group,\n            )\n            token_capacity = tensor.item()\n            logger.info(\n                "[MTP-PP-CAPACITY-GLOBAL] PP%d global_min_tokens=%d",\n                int(self.ps.pp_rank),\n                int(token_capacity),\n            )\n\n        return token_capacity\n'''
 
-if "[MTP-PP-POOL-PROFILE]" not in s:
+if "[MTP-PP-CAPACITY-LOCAL]" not in s:
     if old not in s:
-        raise RuntimeError("DefaultPoolConfigurator EAGLE draft-KV pricing block not found")
+        raise RuntimeError("PP capacity MIN-reduction block not found")
     s = s.replace(old, new, 1)
     P.write_text(s)
 
 s = P.read_text()
-marker = "[MTP-PP-POOL-PROFILE]"
-if marker not in s:
-    raise RuntimeError("PP-aware MTP pool-profile marker missing")
-window_start = s.find(marker)
-window = s[window_start - 1200 : window_start + 2600]
 for required in (
-    "_mtp_pp_draft_budget_owner",
-    "kvc.ps.pp_rank == kvc.ps.pp_size - 1",
-    "skips phantom draft KV",
-    "owns draft KV budget",
+    "[MTP-PP-CAPACITY-LOCAL]",
+    "[MTP-PP-CAPACITY-GLOBAL]",
+    "torch.distributed.ReduceOp.MIN",
+    "self.layer_info.start_layer",
+    "self.layer_info.end_layer",
 ):
-    if required not in window:
-        raise RuntimeError(f"PP-aware pool-profile patch missing: {required}")
+    if required not in s:
+        raise RuntimeError(f"PP capacity diagnostic missing: {required}")
 
-print("PATCHED PP-aware native MTP KV pool profiling")
-print("VERIFIED only PP-last is charged the draft KV surcharge")
+# This patch must not change the capacity arithmetic itself.
+if "_mtp_pp_draft_budget_owner" in s or "skips phantom draft KV" in s:
+    raise RuntimeError("obsolete phantom draft-KV pricing patch is still present")
+
+print("PATCHED PP local/global KV capacity diagnostics")
+print("VERIFIED capacity arithmetic unchanged; logging wraps PP MIN reduction only")
 print(P)
