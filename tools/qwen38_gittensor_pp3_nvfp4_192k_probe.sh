@@ -9,12 +9,16 @@ export CONTAINER="${CONTAINER:-sglang-qwen38-gittensor-pp3}"
 export CTX="${CTX:-196608}"
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-196608}"
 
-# Native MTP + row-wise FP8 embedding candidate.  Compared with the validated
-# 19,24,21 split this moves five target layers off PP-last so PP2 drops from
-# six to four full-attention layers while PP0/PP1 absorb the target-only work.
-export PARTITION="${PARTITION:-20,28,16}"
+# Native MTP + row-wise FP8 embedding candidate.
+# 23,27,14 keeps the full-attention distribution at 5/7/4 while moving only
+# linear-attention layers: PP0 absorbs three linear layers, PP1 sheds one net
+# linear layer, and PP2 sheds two. This preserves KV bytes/token while freeing
+# target-weight/Mamba headroom on the two stages that limited 20,28,16.
+export PARTITION="${PARTITION:-23,27,14}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
-export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-593920}"
+# Exact 3 x 196608 target. Do not reserve the old extra 4096 tokens while PP2
+# is still tight enough that FlashInfer draft-backend workspace matters.
+export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-589824}"
 
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 export MAX_RUNNING="${MAX_RUNNING:-3}"
