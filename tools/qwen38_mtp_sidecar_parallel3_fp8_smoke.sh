@@ -13,18 +13,23 @@ OUTPUT_TOKENS="${MTP_P3_OUTPUT_TOKENS:-64}"
 
 cd "$REPO"
 
-echo '=== PREFLIGHT EXACT IMAGE FP8 DRAFT-KV ABI ==='
+echo '=== PREFLIGHT EXACT IMAGE GLOBAL FP8-KV ABI ==='
 HELP_OUT="$(mktemp)"
 if ! docker run --rm "$IMAGE" python3 -m sglang.launch_server --help >"$HELP_OUT" 2>&1; then
   cat "$HELP_OUT"
   exit 1
 fi
-if ! grep -q -- '--speculative-draft-kv-cache-dtype' "$HELP_OUT"; then
-  echo "ERROR: exact image does not expose --speculative-draft-kv-cache-dtype"
+if ! grep -q -- '--kv-cache-dtype' "$HELP_OUT" || ! grep -q 'fp8_e4m3' "$HELP_OUT"; then
+  echo 'ERROR: exact image does not expose --kv-cache-dtype fp8_e4m3'
   grep -E -- '--kv-cache-dtype|speculative.*kv' "$HELP_OUT" || true
   exit 1
 fi
-grep -E -- '--kv-cache-dtype|--speculative-draft-kv-cache-dtype' "$HELP_OUT" | head -12 || true
+# This exact image predates --speculative-draft-kv-cache-dtype.  Its draft
+# ModelRunner consumes the same explicit server_args.kv_cache_dtype, so one
+# global fp8_e4m3 setting quantizes both target and CUDA2 draft KV.  Do not
+# require or pass the newer per-draft CLI flag here.
+echo 'exact-image mode: one global --kv-cache-dtype fp8_e4m3 for target + draft'
+grep -E -- '--kv-cache-dtype|speculative.*kv' "$HELP_OUT" | head -12 || true
 
 echo '=== APPLY AUTHORITATIVE CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
@@ -34,7 +39,7 @@ python3 tools/qwen38_mtp_cutover_mamba_tracking_hotfix.py
 echo '=== HOTFIX BATCH-AWARE CUDA2 STATE ==='
 python3 tools/qwen38_mtp_cutover_parallel3_hotfix.py --commit
 
-echo '=== RECREATE SERVER: FP8 TARGET + FP8 DRAFT, LOGICAL 256K x 3 ==='
+echo '=== RECREATE SERVER: GLOBAL FP8 KV, LOGICAL 256K x 3 ==='
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d \
@@ -55,7 +60,6 @@ docker run -d \
     --trust-remote-code \
     --context-length 262144 \
     --kv-cache-dtype fp8_e4m3 \
-    --speculative-draft-kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --max-running-requests "$MAX_RUNNING" \
     --max-mamba-cache-size "$MAX_MAMBA" \
@@ -80,7 +84,7 @@ echo "StartedAt: $STARTED"
 dump_failure() {
   echo '=== FAILURE SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-    grep -E 'MTP-CUTOVER|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory' | \
+    grep -E 'MTP-CUTOVER|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory' | \
     tail -420 || true
   echo '=== FAILURE TAIL ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -320 || true
@@ -103,7 +107,7 @@ fi
 echo '=== STARTUP GATES ==='
 START_LOG="$(mktemp)"
 docker logs --since "$STARTED" "$CONTAINER" >"$START_LOG" 2>&1 || true
-grep -E 'MTP-CUTOVER|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph' "$START_LOG" | tail -260 || true
+grep -E 'MTP-CUTOVER|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph' "$START_LOG" | tail -280 || true
 
 TARGET_TOKENS="$(sed -nE 's/.*MTP-CUTOVER-POOL.*target_rank=0 target_tokens=([0-9]+).*/\1/p' "$START_LOG" | tail -1)"
 SIDE_TOKENS="$(sed -nE 's/.*MTP-CUTOVER-POOL.*CUDA2 side_tokens=([0-9]+).*/\1/p' "$START_LOG" | tail -1)"
@@ -213,4 +217,4 @@ grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND)|Prefill batch|Decode batch|Sched
 echo '=== CONTAINER STATUS ==='
 docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER"
 
-echo 'MTP FP8 KV PARALLEL-3 SMOKE COMPLETE'
+echo 'MTP GLOBAL-FP8 KV PARALLEL-3 SMOKE COMPLETE'
