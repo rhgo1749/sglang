@@ -43,16 +43,50 @@ if "[MTP-PP-TRANSPORT-IDS]" not in s:
         raise RuntimeError("native MTP draft input construction point not found")
     s = s.replace(construct_needle, construct_replacement, 1)
 
-# Guard every explicit draft-prefill block. Base images have had more than one
-# symmetric prefill path, so patch all occurrences rather than only the first.
-guard_marker = "[MTP-PP-NON-DRAFT-RANK]"
-draft_prefill = '''            # Draft prefill\n            with (\n                self.draft_worker.draft_tp_context(\n                    self.draft_worker.draft_runner.tp_group\n                ),\n'''
-guarded_prefill = '''            # Draft prefill\n            if self._draft_worker is None:\n                logger.debug("[MTP-PP-NON-DRAFT-RANK] target-only PP stage")\n                return batch_output\n            with (\n                self.draft_worker.draft_tp_context(\n                    self.draft_worker.draft_runner.tp_group\n                ),\n'''
-if guard_marker not in s:
-    count = s.count(draft_prefill)
-    if count == 0:
-        raise RuntimeError("native MTP draft-prefill blocks not found")
-    s = s.replace(draft_prefill, guarded_prefill)
+# Prefill-side PP constructs the native MTP draft only on the last target
+# stage.  Guard at the semantic boundary (immediately after target prefill is
+# published), not by matching the wording/format of the following draft block.
+# This protects every draft-prefill context below it, including base-image
+# variants whose comments or context-manager layout differ.
+owner_marker = "[MTP-PP-PREFILL-OWNER]"
+fn_start = s.find("    def forward_batch_generation(")
+if fn_start < 0:
+    raise RuntimeError("forward_batch_generation not found in eagle_worker_v2.py")
+fn_end = s.find("\n    def ", fn_start + len("    def forward_batch_generation("))
+if fn_end < 0:
+    fn_end = len(s)
+fn = s[fn_start:fn_end]
+
+if owner_marker not in fn:
+    publish_needle = '''            if on_publish is not None:\n                on_publish(batch_output.new_seq_lens)\n'''
+    publish_at = fn.find(publish_needle)
+    if publish_at < 0:
+        raise RuntimeError(
+            "native MTP prefill publish boundary not found in forward_batch_generation"
+        )
+    publish_end = publish_at + len(publish_needle)
+    owner_guard = '''\n            # Native PP-MTP ownership boundary: PP0/PP1 are target-only relay\n            # stages. Only the last PP stage owns the colocated draft worker.\n            if self._draft_worker is None:\n                logger.debug("[MTP-PP-PREFILL-OWNER] target-only PP stage")\n                return batch_output\n'''
+    fn = fn[:publish_end] + owner_guard + fn[publish_end:]
+    s = s[:fn_start] + fn + s[fn_end:]
+
+# Build-time audit: the ownership boundary must occur before the first draft
+# context in the prefill branch.  Fail the image build instead of discovering
+# a missed textual variant at runtime again.
+fn_start = s.find("    def forward_batch_generation(")
+fn_end = s.find("\n    def ", fn_start + len("    def forward_batch_generation("))
+if fn_end < 0:
+    fn_end = len(s)
+fn = s[fn_start:fn_end]
+guard_at = fn.find(owner_marker)
+draft_at = fn.find("self.draft_worker.draft_tp_context(")
+if guard_at < 0:
+    raise RuntimeError("native MTP PP prefill ownership guard was not installed")
+if draft_at < 0:
+    raise RuntimeError("native MTP PP draft context not found for ownership audit")
+if guard_at > draft_at:
+    raise RuntimeError(
+        "native MTP PP ownership guard appears after the first draft context"
+    )
 
 EAGLE.write_text(s)
 
@@ -79,6 +113,7 @@ if "[MTP-PP-INPUT-OOB]" not in s:
 
 MTP.write_text(s)
 print("PATCHED native MTP PP token transport, draft ownership, and endpoints")
+print("VERIFIED [MTP-PP-PREFILL-OWNER] before first draft context")
 print(SCHED)
 print(EAGLE)
 print(MTP)
