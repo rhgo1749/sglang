@@ -126,6 +126,67 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def _mtp_sidecar_parallel_context(tp_group):
+    """Temporarily make the CUDA2 sidecar a coherent TP1/ATTN-TP1 runtime.
+
+    SGLang's normal draft_tp_context only swaps _TP.  Qwen3.5/3.8 attention
+    construction and LayerCommunicator also consume the separate attention
+    topology, so a TP1 sidecar built with the target's _ATTN_TP becomes a
+    permanently half-sharded attention model.  Stack the relevant pointers
+    directly instead of nesting patch_tensor_parallel_group; this is safe both
+    inside and outside an existing draft context and restores every value.
+    """
+    import sglang.srt.distributed.parallel_state as _ps
+    from sglang.srt.layers import dp_attention as _dp
+
+    _saved_tp = _ps._TP
+    _saved_attn_tp = _ps._ATTN_TP
+    _saved_attn_cp = _ps._ATTN_CP
+    _saved_attn_dp_size = _dp._ATTN_DP_SIZE
+    _saved_attn_dp_rank = _dp._ATTN_DP_RANK
+
+    _rank = int(getattr(tp_group, "rank_in_group", 0))
+    _size = int(getattr(tp_group, "world_size", 1))
+    if _size != 1:
+        raise RuntimeError(
+            f"MTP sidecar requires a singleton TP group, got world_size={_size}"
+        )
+
+    _ps._TP = tp_group
+    _ps._ATTN_TP = tp_group
+    _ps._ATTN_CP = tp_group
+    _dp._ATTN_DP_SIZE = 1
+    _dp._ATTN_DP_RANK = 0
+
+    try:
+        with get_parallel().override(
+            tp_size=1,
+            tp_rank=_rank,
+            tp_group=tp_group,
+            attn_tp_size=1,
+            attn_tp_rank=_rank,
+            attn_tp_group=tp_group,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            attn_cp_group=tp_group,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            dcp_enabled=False,
+            dcp_size=1,
+            dcp_rank=0,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+        ):
+            yield
+    finally:
+        _dp._ATTN_DP_RANK = _saved_attn_dp_rank
+        _dp._ATTN_DP_SIZE = _saved_attn_dp_size
+        _ps._ATTN_CP = _saved_attn_cp
+        _ps._ATTN_TP = _saved_attn_tp
+        _ps._TP = _saved_tp
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -225,7 +286,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 torch.cuda.set_device(sidecar_gpu_id)
 
                 with (
-                    draft_tp_context(get_self_pp_group()),
+                    _mtp_sidecar_parallel_context(get_self_pp_group()),
                     draft_pp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -289,7 +350,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 torch.cuda.set_device(sidecar_gpu_id)
 
                 with (
-                    draft_tp_context(get_self_pp_group()),
+                    _mtp_sidecar_parallel_context(get_self_pp_group()),
                     draft_pp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -853,6 +914,43 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             mr = sidecar.model_runner
 
+            if not getattr(self, "_mtp_sidecar_topology_checked", False):
+                _attn_sizes = set()
+                _comm_attn_sizes = set()
+                _comm_tp_sizes = set()
+                for _name, _mod in mr.model.named_modules():
+                    _attn_size = getattr(_mod, "attn_tp_size", None)
+                    if _attn_size is not None:
+                        _attn_sizes.add(int(_attn_size))
+                    _comm = getattr(_mod, "layer_communicator", None)
+                    _ctx = getattr(_comm, "_context", None)
+                    if _ctx is not None:
+                        _comm_attn_sizes.add(int(_ctx.attn_tp_size))
+                        _comm_tp_sizes.add(int(_ctx.tp_size))
+
+                if _attn_sizes and _attn_sizes != {1}:
+                    raise RuntimeError(
+                        f"CUDA2 sidecar attention was not built TP1: {_attn_sizes}"
+                    )
+                if _comm_attn_sizes and _comm_attn_sizes != {1}:
+                    raise RuntimeError(
+                        "CUDA2 sidecar LayerCommunicator captured non-TP1 "
+                        f"attention topology: {_comm_attn_sizes}"
+                    )
+                if _comm_tp_sizes and _comm_tp_sizes != {1}:
+                    raise RuntimeError(
+                        "CUDA2 sidecar LayerCommunicator captured non-TP1 "
+                        f"generic topology: {_comm_tp_sizes}"
+                    )
+
+                self._mtp_sidecar_topology_checked = True
+                logger.info(
+                    "[MTP-SIDECAR-TOPO] static attention=%s communicator_attn=%s communicator_tp=%s",
+                    sorted(_attn_sizes),
+                    sorted(_comm_attn_sizes),
+                    sorted(_comm_tp_sizes),
+                )
+
             # get_rope() uses a process-wide module cache.  The target model
             # therefore leaves the shared RoPE cache on CUDA0 even though this
             # sidecar model itself lives on CUDA2.  Never move that shared
@@ -908,7 +1006,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or not hasattr(mr, "decode_cuda_graph_runner")
             ):
                 with (
-                    draft_tp_context(get_self_pp_group()),
+                    _mtp_sidecar_parallel_context(get_self_pp_group()),
                     draft_pp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
@@ -1053,7 +1151,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             with (
-                draft_tp_context(get_self_pp_group()),
+                _mtp_sidecar_parallel_context(get_self_pp_group()),
                 draft_pp_context(),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
@@ -1136,28 +1234,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         ),
                     )
 
-                # The normal draft_tp_context only patches _TP.  Qwen3.5/3.8
-                # layer communication also consults the separate global
-                # _ATTN_TP, which still points at the target TP2 NCCL group.
-                # For this TP1 CUDA2 sidecar, temporarily make both groups the
-                # same singleton coordinator and restore the target group
-                # immediately after the forward.
-                import sglang.srt.distributed.parallel_state as _ps
+                # ForwardBatch.init_new and the model forward are already
+                # enclosed by _mtp_sidecar_parallel_context, so do not nest
+                # SGLang's non-reentrant draft TP/PP patchers here.
+                side_logits = mr.forward(forward_batch).logits_output
 
-                _side_tp_group = get_self_pp_group()
-                _saved_attn_tp = _ps._ATTN_TP
-
-                try:
-                    _ps._ATTN_TP = _side_tp_group
-                    with (
-                        draft_tp_context(_side_tp_group),
-                        draft_pp_context(),
-                        speculative_moe_backend_context(),
-                        speculative_moe_a2a_backend_context(),
-                    ):
-                        side_logits = mr.forward(forward_batch).logits_output
-                finally:
-                    _ps._ATTN_TP = _saved_attn_tp
+                # Surface asynchronous CUDA faults on CUDA2 here.  Otherwise a
+                # shadow-side illegal access can be reported later by the
+                # authoritative target draft and produce a misleading traceback.
+                torch.cuda.synchronize(sidecar_gpu_id)
 
             if side_logits.next_token_logits is None:
                 raise RuntimeError("CUDA2 sidecar returned no next_token_logits")
@@ -1554,7 +1639,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # testing; if the coordinator is too tightly bound to the
                 # target CUDA device, startup will tell us here.
                 with (
-                    draft_tp_context(get_self_pp_group()),
+                    _mtp_sidecar_parallel_context(get_self_pp_group()),
                     draft_pp_context(),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),

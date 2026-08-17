@@ -109,6 +109,23 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             else quant_config
         )
 
+        # The self-contained ModelOpt sidecar must be TP1 for BOTH generic TP
+        # and attention TP before Qwen3_5ForCausalLM is constructed.  QKV/O-proj
+        # shard sizes and LayerCommunicator topology are captured here and cannot
+        # be repaired by swapping an NCCL group later during forward.
+        if self._load_full_embed_head and (
+            self.tp_size != 1
+            or get_parallel().attn_tp_size != 1
+            or get_parallel().attn_dp_size != 1
+            or get_parallel().attn_cp_size != 1
+        ):
+            raise RuntimeError(
+                "TP1 MTP sidecar was constructed with non-TP1 attention topology: "
+                f"tp={self.tp_size}, attn_tp={get_parallel().attn_tp_size}, "
+                f"attn_dp={get_parallel().attn_dp_size}, "
+                f"attn_cp={get_parallel().attn_cp_size}"
+            )
+
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
