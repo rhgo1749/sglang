@@ -31,6 +31,16 @@ kill_child_group() {
   kill -KILL -- "-$CHILD" >/dev/null 2>&1 || true
 }
 
+dump_failure_log() {
+  echo '=== IMMEDIATE FAILURE SUMMARY ==='
+  grep -Ei 'PP[0-9]|MTP|speculative|Scheduler hit an exception|Traceback|AssertionError|RuntimeError|ValueError|CUDA error|out of memory|Exception triggered' "$TMP/log" | tail -80 || true
+  echo
+  echo '=== IMMEDIATE FAILURE RAW TAIL ==='
+  # Do not grep the traceback here: Python continuation frames and the final
+  # exception message often do not contain any of the summary keywords.
+  tail -260 "$TMP/log" || true
+}
+
 while kill -0 "$CHILD" >/dev/null 2>&1; do
   if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     docker logs "$CONTAINER" >"$TMP/log" 2>&1 || true
@@ -40,8 +50,7 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
       echo 'FAILFAST_SERVER_ERROR=True'
       echo 'Detected fatal scheduler/worker error; aborting the waiting request.'
       kill_child_group
-      echo '=== IMMEDIATE FAILURE LOG ==='
-      grep -Ei 'PP[0-9]|MTP|speculative|Scheduler hit an exception|Traceback|AssertionError|RuntimeError|ValueError|CUDA error|out of memory|Exception triggered' "$TMP/log" | tail -220 || true
+      dump_failure_log
       exit 90
     fi
 
@@ -51,8 +60,7 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
       echo 'FAILFAST_CONTAINER_EXIT=True'
       echo 'Container exited while the probe was still waiting.'
       kill_child_group
-      echo '=== IMMEDIATE FAILURE LOG ==='
-      tail -220 "$TMP/log" || true
+      dump_failure_log
       exit 91
     fi
   fi
