@@ -359,7 +359,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 import os as _mtp_os
                 _mtp_default_min_pool = (
                     32768
-                    if int(get_schedule().max_running_requests or 1) > 1
+                    if int(getattr(self.server_args, "max_running_requests", 1) or 1) > 1
                     else 65536
                 )
                 _mtp_min_pool_tokens = int(
@@ -2615,7 +2615,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             import os as _mtp_os
             _mtp_default_min_pool = (
                 32768
-                if int(get_schedule().max_running_requests or 1) > 1
+                if int(getattr(self.server_args, "max_running_requests", 1) or 1) > 1
                 else 65536
             )
             _mtp_min_pool_tokens = int(
