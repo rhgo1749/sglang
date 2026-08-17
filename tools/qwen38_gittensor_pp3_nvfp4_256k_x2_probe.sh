@@ -44,6 +44,14 @@ export STAGE="${STAGE:-262000}"
 export DECODE_TOKENS="${DECODE_TOKENS:-8}"
 export REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-1200}"
 
+# A healthy chunked-prefill run emits frequent server progress and keeps at
+# least one GPU busy.  Do not sit on a deadlocked request until curl's 20-minute
+# timeout: after progress has started, fail if logs stop advancing and all GPUs
+# stay effectively idle for this bounded interval.  The watcher removes the
+# failed probe container after preserving diagnostics, so VRAM is reclaimed.
+export FAILFAST_STALL_SECONDS="${FAILFAST_STALL_SECONDS:-45}"
+export FAILFAST_STALL_GPU_UTIL_MAX="${FAILFAST_STALL_GPU_UTIL_MAX:-5}"
+
 echo '============================================================'
 echo ' QWEN3.8 GITTENSOR NVFP4 PP3 / NATIVE MTP / 2x256K PROBE'
 echo " model=${MODEL}"
@@ -58,6 +66,7 @@ echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " stress_prompt_tokens=${STAGE}"
 echo " decode_tokens=${DECODE_TOKENS}"
+echo " failfast_stall_seconds=${FAILFAST_STALL_SECONDS}"
 echo ' MTP ON / CUDA GRAPH OFF'
 echo '============================================================'
 
