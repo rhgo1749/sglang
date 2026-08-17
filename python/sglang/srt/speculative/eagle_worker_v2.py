@@ -173,9 +173,9 @@ def _mtp_sidecar_parallel_context(tp_group):
             # The target may be forced to page_size=64 by TRTLLM-MHA/NVFP4.
             # CUDA2 owns an independent FlashInfer KV pool and the cutover
             # helpers allocate exact token spans (including 3/4-token draft
-            # tails), so keep the sidecar on a TRTLLM-compatible paged allocator (page_size=64).
-            # Arbitrary speculative spans are handled by the high-water alloc_extend path below.
-            get_schedule().override(page_size=64),
+            # tails), so keep the sidecar on the FlashInfer token allocator (page_size=1).
+            # Speculative spans still use the high-water helper so rejected tails are reused safely.
+            get_schedule().override(page_size=1),
             get_parallel().override(
                 tp_size=1,
                 tp_rank=_rank,
@@ -323,9 +323,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
                 mr = self.draft_runner
-                if int(getattr(mr, "page_size", -1)) != 64:
+                if int(getattr(mr, "page_size", -1)) != 1:
                     raise RuntimeError(
-                        "CUDA2 MTP sidecar must use page_size=64; got "
+                        "CUDA2 MTP sidecar must use page_size=1; got "
                         f"{getattr(mr, 'page_size', None)} with "
                         f"allocator={type(mr.token_to_kv_pool_allocator).__name__}"
                     )
@@ -336,9 +336,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     type(mr.token_to_kv_pool_allocator).__name__,
                 )
                 logger.info(
-                    "[MTP-CUTOVER-PAGED] CUDA%d page_size=%d high-water allocator enabled",
+                    "[MTP-CUTOVER-HIGHWATER] CUDA%d page_size=%d allocator=%s",
                     self.gpu_id,
                     int(mr.page_size),
+                    type(mr.token_to_kv_pool_allocator).__name__,
                 )
                 logger.info(
                     "[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s",
@@ -2682,22 +2683,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # that still reads server_args.page_size agrees with the scoped
                 # schedule bag used while the sidecar is built/run.
                 _side_server_args = _mtp_copy.copy(server_args)
-                object.__setattr__(_side_server_args, "page_size", 64)
+                object.__setattr__(_side_server_args, "page_size", 1)
                 if getattr(server_args, "kv_cache_dtype", None) == "nvfp4":
                     object.__setattr__(
-                        _side_server_args, "kv_cache_dtype", "nvfp4"
+                        _side_server_args, "kv_cache_dtype", "fp8_e4m3"
                     )
                     object.__setattr__(
-                        _side_server_args, "speculative_draft_attention_backend", None
+                        _side_server_args, "speculative_draft_attention_backend", "flashinfer"
                     )
                     object.__setattr__(
                         _side_server_args, "prefill_attention_backend", "flashinfer"
                     )
                     object.__setattr__(
-                        _side_server_args, "decode_attention_backend", "trtllm_mha"
+                        _side_server_args, "decode_attention_backend", "flashinfer"
                     )
                     logger.info(
-                        "[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=nvfp4",
+                        "[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=fp8_e4m3",
                         sidecar_gpu_id,
                     )
 
