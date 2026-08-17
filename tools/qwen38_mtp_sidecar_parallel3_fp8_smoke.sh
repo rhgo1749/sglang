@@ -13,6 +13,19 @@ OUTPUT_TOKENS="${MTP_P3_OUTPUT_TOKENS:-64}"
 
 cd "$REPO"
 
+echo '=== PREFLIGHT EXACT IMAGE FP8 DRAFT-KV ABI ==='
+HELP_OUT="$(mktemp)"
+if ! docker run --rm "$IMAGE" python3 -m sglang.launch_server --help >"$HELP_OUT" 2>&1; then
+  cat "$HELP_OUT"
+  exit 1
+fi
+if ! grep -q -- '--speculative-draft-kv-cache-dtype' "$HELP_OUT"; then
+  echo "ERROR: exact image does not expose --speculative-draft-kv-cache-dtype"
+  grep -E -- '--kv-cache-dtype|speculative.*kv' "$HELP_OUT" || true
+  exit 1
+fi
+grep -E -- '--kv-cache-dtype|--speculative-draft-kv-cache-dtype' "$HELP_OUT" | head -12 || true
+
 echo '=== APPLY AUTHORITATIVE CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
 python3 tools/qwen38_mtp_cutover_pp_hotfix.py
@@ -102,7 +115,7 @@ fi
 printf 'target_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
   "$TARGET_TOKENS" "$SIDE_TOKENS" "$MAX_RUNNING"
 
-# Leave room for verify/draft tails and outputs.  This deliberately fills most
+# Leave room for verify/draft tails and outputs. This deliberately fills most
 # of the shared physical pool across three independent logical-256K requests.
 POOL_MIN="$TARGET_TOKENS"
 if (( SIDE_TOKENS < POOL_MIN )); then POOL_MIN="$SIDE_TOKENS"; fi
@@ -153,6 +166,7 @@ sleep 1
 REQ_LOG=/tmp/qwen38-p3-runtime.log
 docker logs --since "$REQ_SINCE" "$CONTAINER" >"$REQ_LOG" 2>&1 || true
 
+set +e
 python3 - "$MAX_RUNNING" "$START_NS" "$END_NS" "$PER_PROMPT" "$OUTPUT_TOKENS" <<'PY'
 import json, pathlib, sys
 nr, start_ns, end_ns, expected_prompt, expected_output = map(int, sys.argv[1:])
@@ -185,6 +199,7 @@ if not all_ok:
     raise SystemExit(1)
 PY
 PY_RC=$?
+set -e
 
 if [[ $RC -ne 0 || $PY_RC -ne 0 ]]; then
   echo 'PARALLEL REQUEST FAILURE'
