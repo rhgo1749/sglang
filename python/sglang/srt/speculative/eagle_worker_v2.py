@@ -126,6 +126,10 @@ _is_xpu = is_xpu()
 logger = logging.getLogger(__name__)
 
 
+_MTP_SIDECAR_BUFFERS = {}
+_MTP_SIDECAR_STREAMS = {}
+
+
 @contextlib.contextmanager
 def _mtp_sidecar_parallel_context(tp_group):
     """Temporarily make the CUDA2 sidecar a coherent TP1/ATTN-TP1 runtime.
@@ -160,23 +164,29 @@ def _mtp_sidecar_parallel_context(tp_group):
     _dp._ATTN_DP_RANK = 0
 
     try:
-        with get_parallel().override(
-            tp_size=1,
-            tp_rank=_rank,
-            tp_group=tp_group,
-            attn_tp_size=1,
-            attn_tp_rank=_rank,
-            attn_tp_group=tp_group,
-            attn_cp_size=1,
-            attn_cp_rank=0,
-            attn_cp_group=tp_group,
-            attn_dp_size=1,
-            attn_dp_rank=0,
-            dcp_enabled=False,
-            dcp_size=1,
-            dcp_rank=0,
-            attn_dcp_size=1,
-            attn_dcp_rank=0,
+        with (
+            get_context().resources.override(
+                buffers=_MTP_SIDECAR_BUFFERS,
+                streams=_MTP_SIDECAR_STREAMS,
+            ),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=_rank,
+                tp_group=tp_group,
+                attn_tp_size=1,
+                attn_tp_rank=_rank,
+                attn_tp_group=tp_group,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                attn_cp_group=tp_group,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                dcp_enabled=False,
+                dcp_size=1,
+                dcp_rank=0,
+                attn_dcp_size=1,
+                attn_dcp_rank=0,
+            ),
         ):
             yield
     finally:
@@ -358,6 +368,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self._mtp_sidecar_probe.init_attention_backends()
 
                 mr = self._mtp_sidecar_probe.model_runner
+
+                _side_ws = _MTP_SIDECAR_BUFFERS.get("flashinfer_workspace")
+                _target_ws = get_context().resources.buffers.get("flashinfer_workspace")
+                if isinstance(_side_ws, torch.Tensor):
+                    if _side_ws.device != torch.device("cuda", sidecar_gpu_id):
+                        raise RuntimeError(
+                            "CUDA2 sidecar FlashInfer workspace landed on the wrong device: "
+                            f"{_side_ws.device}"
+                        )
+                    if isinstance(_target_ws, torch.Tensor) and (
+                        _side_ws.data_ptr() == _target_ws.data_ptr()
+                    ):
+                        raise RuntimeError(
+                            "CUDA2 sidecar still aliases the target FlashInfer workspace"
+                        )
+
+                logger.info(
+                    "[MTP-SIDECAR-RESOURCE] side_flashinfer=%s target_flashinfer=%s separate=%s",
+                    (str(_side_ws.device) if isinstance(_side_ws, torch.Tensor) else None),
+                    (str(_target_ws.device) if isinstance(_target_ws, torch.Tensor) else None),
+                    (
+                        not isinstance(_side_ws, torch.Tensor)
+                        or not isinstance(_target_ws, torch.Tensor)
+                        or _side_ws.data_ptr() != _target_ws.data_ptr()
+                    ),
+                )
                 logger.info(
                     "[MTP-SIDECAR-ATTN] CUDA%d attention backend ready: %s",
                     sidecar_gpu_id,
