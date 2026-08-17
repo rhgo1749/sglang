@@ -97,6 +97,7 @@ def main() -> None:
         )
         diff = subprocess.run(
             ["git", "diff", "--cached", "--quiet"], cwd=REPO, check=False
+        )
         if diff.returncode != 0:
             subprocess.run(
                 [
