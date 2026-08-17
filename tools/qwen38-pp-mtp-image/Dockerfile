@@ -18,6 +18,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_verify_nvfp4_metadata.py /tmp/patch_
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_pool_profile.py /tmp/patch_mtp_pp_pool_profile.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_local_memory_budget.py /tmp/patch_mtp_pp_local_memory_budget.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_embed_fp8.py /tmp/patch_mtp_pp_embed_fp8.py
+COPY tools/qwen38-pp-mtp-image/patch_nvfp4_sequential_dequant.py /tmp/patch_nvfp4_sequential_dequant.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -33,11 +34,13 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_pool_profile.py \
  && python3 /tmp/patch_mtp_pp_local_memory_budget.py \
  && python3 /tmp/patch_mtp_pp_embed_fp8.py \
+ && python3 /tmp/patch_nvfp4_sequential_dequant.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
       /sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py \
+      /sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_common.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py \
       /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_mtp.py \
@@ -55,4 +58,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_verify_nvfp4_metadata.py \
       /tmp/patch_mtp_pp_pool_profile.py \
       /tmp/patch_mtp_pp_local_memory_budget.py \
-      /tmp/patch_mtp_pp_embed_fp8.py
+      /tmp/patch_mtp_pp_embed_fp8.py \
+      /tmp/patch_nvfp4_sequential_dequant.py
