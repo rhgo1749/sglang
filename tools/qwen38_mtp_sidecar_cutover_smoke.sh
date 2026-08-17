@@ -12,6 +12,9 @@ cd "$REPO"
 echo '=== APPLY CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
 
+echo '=== HOTFIX NESTED PP CONTEXT ==='
+python3 tools/qwen38_mtp_cutover_pp_hotfix.py
+
 echo '=== RECREATE SERVER ==='
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
