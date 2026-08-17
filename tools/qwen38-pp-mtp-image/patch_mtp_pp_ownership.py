@@ -4,15 +4,24 @@ EAGLE = Path("/sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v
 MTP = Path("/sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_mtp.py")
 
 # 1) Prefill-side PP constructs the native MTP draft only on the last stage.
-# Return from earlier PP ranks only AFTER target prefill has produced batch_output.
+# Insert structurally after the first target-prefill publish point rather than
+# depending on upstream comments/whitespace, which vary across qwen38 images.
 s = EAGLE.read_text()
 
-safe_prefill_needle = '''            # Publish before draft_extend so the fence is at target-end.\n            if on_publish is not None:\n                on_publish(batch_output.new_seq_lens)\n\n            # Draft prefill\n'''
-safe_prefill_replacement = '''            # Publish before draft_extend so the fence is at target-end.\n            if on_publish is not None:\n                on_publish(batch_output.new_seq_lens)\n\n            # Prefill-side PP owns the native MTP draft only on the last stage.\n            # Earlier stages have a valid target batch_output but no draft worker.\n            if self._draft_worker is None:\n                return batch_output\n\n            # Draft prefill\n'''
-if "Earlier stages have a valid target batch_output but no draft worker" not in s:
-    if safe_prefill_needle not in s:
-        raise RuntimeError("safe native MTP PP prefill insertion point not found")
-    s = s.replace(safe_prefill_needle, safe_prefill_replacement, 1)
+guard_marker = "Earlier stages have a valid target batch_output but no draft worker"
+if guard_marker not in s:
+    fn_pos = s.find("    def forward_batch_generation(")
+    if fn_pos < 0:
+        raise RuntimeError("forward_batch_generation not found")
+
+    publish_stmt = "                on_publish(batch_output.new_seq_lens)\n"
+    publish_pos = s.find(publish_stmt, fn_pos)
+    if publish_pos < 0:
+        raise RuntimeError("target-prefill publish point not found")
+
+    insert_pos = publish_pos + len(publish_stmt)
+    guard = '''\n            # Prefill-side PP owns the native MTP draft only on the last stage.\n            # Earlier stages have a valid target batch_output but no draft worker.\n            if self._draft_worker is None:\n                return batch_output\n'''
+    s = s[:insert_pos] + guard + s[insert_pos:]
 
 # 2) The last PP stage can receive proxy/placeholder values in ScheduleBatch.input_ids
 # because target execution there consumes pipeline hidden states, not token embeddings.
@@ -50,6 +59,6 @@ if "[MTP-PP-INPUT-OOB]" not in s:
     s = s.replace(old_embed, new_embed, 1)
 
 MTP.write_text(s)
-print("PATCHED native MTP PP safe ownership, prompt-id restoration, and endpoint sharing")
+print("PATCHED native MTP PP structural ownership, prompt-id restoration, and endpoint sharing")
 print(EAGLE)
 print(MTP)
