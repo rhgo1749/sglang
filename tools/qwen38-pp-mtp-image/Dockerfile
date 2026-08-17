@@ -16,6 +16,7 @@ COPY tools/qwen38-pp-mtp-image/fix_mtp_pp_spec_bridge_installer.py /tmp/fix_mtp_
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_bridge_serializer.py /tmp/patch_mtp_pp_bridge_serializer.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_verify_nvfp4_metadata.py /tmp/patch_mtp_pp_verify_nvfp4_metadata.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_pool_profile.py /tmp/patch_mtp_pp_pool_profile.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_local_memory_budget.py /tmp/patch_mtp_pp_local_memory_budget.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -29,6 +30,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_bridge_serializer.py \
  && python3 /tmp/patch_mtp_pp_verify_nvfp4_metadata.py \
  && python3 /tmp/patch_mtp_pp_pool_profile.py \
+ && python3 /tmp/patch_mtp_pp_local_memory_budget.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
@@ -49,4 +51,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/fix_mtp_pp_spec_bridge_installer.py \
       /tmp/patch_mtp_pp_bridge_serializer.py \
       /tmp/patch_mtp_pp_verify_nvfp4_metadata.py \
-      /tmp/patch_mtp_pp_pool_profile.py
+      /tmp/patch_mtp_pp_pool_profile.py \
+      /tmp/patch_mtp_pp_local_memory_budget.py
