@@ -26,7 +26,11 @@ export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.855}"
 # validating the native MTP capacity and post-pool backend headroom.
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-589824}"
 
-export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
+# 1024-token chunks passed capacity/boot/short smoke but long 3x192K prefill
+# drove PP2 to 4 MiB free and the next 20 MiB runtime allocation OOMed. Halving
+# the chunk reduces transient activation/workspace pressure without changing
+# the 589824-token KV pool or the validated PP partition.
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-512}"
 export MAX_RUNNING="${MAX_RUNNING:-3}"
 export MAX_MAMBA="${MAX_MAMBA:-3}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
