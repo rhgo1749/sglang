@@ -12,6 +12,11 @@ MAX_MAMBA="${MAX_MAMBA:-3}"
 PARTITION="${PARTITION:-19,23,22}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
+# Optional operational capacity requirement. When unset, retain the historical
+# CTX * MAX_RUNNING requirement. This lets a long-context probe reserve exactly
+# the aggregate tokens it will exercise while leaving runtime workspace outside
+# the KV pools.
+CAPACITY_REQUIRED_TOKENS="${CAPACITY_REQUIRED_TOKENS:-}"
 ENABLE_MTP="${ENABLE_MTP:-0}"
 SPECULATIVE_ALGO="${SPECULATIVE_ALGO:-NEXTN}"
 SPECULATIVE_NUM_STEPS="${SPECULATIVE_NUM_STEPS:-3}"
@@ -20,7 +25,11 @@ SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-4}"
 
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-REQUIRED=$((CTX * MAX_RUNNING))
+if [[ -n "$CAPACITY_REQUIRED_TOKENS" ]]; then
+  REQUIRED="$CAPACITY_REQUIRED_TOKENS"
+else
+  REQUIRED=$((CTX * MAX_RUNNING))
+fi
 
 CAPACITY_GATE="${CAPACITY_GATE:-auto}"
 
@@ -82,6 +91,9 @@ echo " pytorch_cuda_alloc_conf=${PYTORCH_CUDA_ALLOC_CONF}"
 echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " required=${REQUIRED}"
+if [[ -n "$CAPACITY_REQUIRED_TOKENS" ]]; then
+  echo " capacity_required_override=${CAPACITY_REQUIRED_TOKENS}"
+fi
 if [[ "${ENABLE_MTP:-0}" == "1" ]]; then
   echo " MTP ON / CUDA GRAPH OFF / SERVER WARMUP OFF"
 else
