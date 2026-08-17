@@ -13,6 +13,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_req_source.py /tmp/patch_mtp_pp_req_
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_mm_identity.py /tmp/patch_mtp_pp_mm_identity.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_spec_bridge.py /tmp/patch_mtp_pp_spec_bridge.py
 COPY tools/qwen38-pp-mtp-image/fix_mtp_pp_spec_bridge_installer.py /tmp/fix_mtp_pp_spec_bridge_installer.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_bridge_serializer.py /tmp/patch_mtp_pp_bridge_serializer.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -23,6 +24,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_mm_identity.py \
  && python3 /tmp/fix_mtp_pp_spec_bridge_installer.py \
  && python3 /tmp/patch_mtp_pp_spec_bridge.py \
+ && python3 /tmp/patch_mtp_pp_bridge_serializer.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
@@ -39,4 +41,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_req_source.py \
       /tmp/patch_mtp_pp_mm_identity.py \
       /tmp/patch_mtp_pp_spec_bridge.py \
-      /tmp/fix_mtp_pp_spec_bridge_installer.py
+      /tmp/fix_mtp_pp_spec_bridge_installer.py \
+      /tmp/patch_mtp_pp_bridge_serializer.py
