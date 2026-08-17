@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -169,6 +170,13 @@ def _mtp_sidecar_parallel_context(tp_group):
                 buffers=_MTP_SIDECAR_BUFFERS,
                 streams=_MTP_SIDECAR_STREAMS,
             ),
+            # The target may be forced to page_size=64 by TRTLLM-MHA/NVFP4.
+            # CUDA2 owns an independent FlashInfer KV pool and the cutover
+            # helpers allocate exact token spans (including 3/4-token draft
+            # tails), so keep the sidecar on the token allocator (page_size=1).
+            # Otherwise PagedTokenToKVPoolAllocator.alloc() floors non-page-
+            # aligned sizes and silently returns too few slots.
+            get_schedule().override(page_size=1),
             get_parallel().override(
                 tp_size=1,
                 tp_rank=_rank,
@@ -315,6 +323,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
                 mr = self.draft_runner
+                if int(getattr(mr, "page_size", -1)) != 1:
+                    raise RuntimeError(
+                        "CUDA2 MTP sidecar must use page_size=1; got "
+                        f"{getattr(mr, 'page_size', None)} with "
+                        f"allocator={type(mr.token_to_kv_pool_allocator).__name__}"
+                    )
+                logger.info(
+                    "[MTP-CUTOVER-PAGE] CUDA%d draft_page_size=%d allocator=%s",
+                    self.gpu_id,
+                    int(mr.page_size),
+                    type(mr.token_to_kv_pool_allocator).__name__,
+                )
                 logger.info(
                     "[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s",
                     self.gpu_id,
@@ -2579,9 +2599,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # FP8 E4M3 KV. Never mutate the published target ServerArgs.
                 import copy as _mtp_copy
 
-                _side_server_args = server_args
+                # CUDA2 is a fully independent draft runtime.  Give it a
+                # private args view even when only page size differs, so code
+                # that still reads server_args.page_size agrees with the scoped
+                # schedule bag used while the sidecar is built/run.
+                _side_server_args = _mtp_copy.copy(server_args)
+                object.__setattr__(_side_server_args, "page_size", 1)
                 if getattr(server_args, "kv_cache_dtype", None) == "nvfp4":
-                    _side_server_args = _mtp_copy.copy(server_args)
                     object.__setattr__(
                         _side_server_args, "kv_cache_dtype", "fp8_e4m3"
                     )
