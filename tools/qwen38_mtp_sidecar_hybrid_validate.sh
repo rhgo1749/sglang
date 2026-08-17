@@ -8,6 +8,22 @@ trap 'rm -f "$BENCH_LOG"' EXIT
 
 cd "$REPO"
 
+echo '=== HYBRID PREFLIGHT: SYNTAX ONLY, NO SERVER TOUCH ==='
+PY_FILES=(
+  tools/qwen38_mtp_sidecar_cutover.py
+  tools/qwen38_mtp_cutover_pp_hotfix.py
+  tools/qwen38_mtp_cutover_mamba_tracking_hotfix.py
+  tools/qwen38_mtp_cutover_parallel3_hotfix.py
+  tools/qwen38_mtp_cutover_pool_gate_hotfix.py
+  tools/qwen38_mtp_cutover_hybrid_fp8_draft_hotfix.py
+)
+for f in "${PY_FILES[@]}"; do
+  python3 -m py_compile "$f"
+done
+bash -n tools/qwen38_mtp_sidecar_parallel3_hybrid_smoke.sh
+bash -n tools/qwen38_mtp_sidecar_benchmark.sh
+echo 'hybrid preflight syntax: OK'
+
 bash tools/qwen38_mtp_sidecar_parallel3_hybrid_smoke.sh
 
 echo '=== HYBRID 27K+1024 ACCEPTANCE BENCH ==='
