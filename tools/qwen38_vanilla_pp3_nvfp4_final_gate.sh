@@ -7,6 +7,7 @@ CONTAINER="${CONTAINER:-sglang-qwen38-vanilla-pp3-final}"
 PORT="${PORT:-30000}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-3}"
+MAX_MAMBA="${MAX_MAMBA:-3}"
 PARTITION="${PARTITION:-19,23,22}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
 REQUIRED=$((CTX * MAX_RUNNING))
@@ -23,17 +24,24 @@ cleanup() {
 
 dump_logs() {
   docker logs "$CONTAINER" 2>&1 | \
-    grep -Ei 'PP[0-9]|pipeline|NVFP4|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Traceback|AssertionError|RuntimeError|CUDA error|out of memory|exception' | \
-    tail -500 || true
+    grep -Ei 'PP[0-9]|pipeline|NVFP4|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|running-req|queue-req|Traceback|AssertionError|RuntimeError|CUDA error|out of memory|exception' | \
+    tail -600 || true
 }
 
 echo '============================================================'
 echo ' QWEN3.8 FINAL VANILLA PP3 + NVFP4 RAW 3x256K GATE'
 echo " partition=${PARTITION}"
 echo " mem_fraction_static=${MEM_FRACTION_STATIC}"
+echo " max_running_requests=${MAX_RUNNING}"
+echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " required=${REQUIRED}"
 echo ' MTP OFF / CUDA GRAPH OFF / NO SOURCE MOUNTS'
 echo '============================================================'
+
+if (( MAX_MAMBA < MAX_RUNNING )); then
+  echo "ERROR: max_mamba_cache_size (${MAX_MAMBA}) must cover max_running_requests (${MAX_RUNNING}) in this no-radix/no-overlap gate"
+  exit 64
+fi
 
 cleanup
 sleep 2
@@ -62,7 +70,7 @@ docker run -d \
     --page-size 64 \
     --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --max-running-requests "$MAX_RUNNING" \
-    --max-mamba-cache-size 8 \
+    --max-mamba-cache-size "$MAX_MAMBA" \
     --mamba-ssm-dtype bfloat16 \
     --mamba-radix-cache-strategy extra_buffer_lazy \
     --disable-radix-cache \
@@ -125,7 +133,7 @@ fi
 
 echo 'FINAL_RAW_3X256K_CAPACITY=PASS'
 
-echo '=== FUNCTIONAL REQUEST ==='
+echo '=== SINGLE FUNCTIONAL REQUEST ==='
 python3 - <<'PY'
 import json
 json.dump({
@@ -157,6 +165,54 @@ else
   dump_logs
   exit 3
 fi
+
+echo '=== PARALLEL-3 MAMBA SLOT CHECK ==='
+for i in 0 1 2; do
+  python3 - "$i" <<'PY'
+import json,sys
+i=int(sys.argv[1])
+json.dump({
+  'input_ids':[1100+i]*256,
+  'sampling_params':{'temperature':0,'max_new_tokens':8,'ignore_eos':True},
+},open(f'/tmp/qwen38-final-p3-{i}.json','w'))
+PY
+done
+PIDS=()
+for i in 0 1 2; do
+  (
+    curl --max-time 90 -sS \
+      -o "/tmp/qwen38-final-p3-${i}-response.json" \
+      -w '%{http_code}' \
+      "http://127.0.0.1:${PORT}/generate" \
+      -H 'Content-Type: application/json' \
+      --data-binary "@/tmp/qwen38-final-p3-${i}.json" \
+      >"/tmp/qwen38-final-p3-${i}-http.txt"
+  ) &
+  PIDS+=("$!")
+done
+P3_RC=0
+for pid in "${PIDS[@]}"; do wait "$pid" || P3_RC=1; done
+python3 - <<'PY'
+import json,pathlib
+ok=True
+for i in range(3):
+    hp=pathlib.Path(f'/tmp/qwen38-final-p3-{i}-http.txt')
+    http=hp.read_text().strip() if hp.exists() else ''
+    print(f'req{i}_http={http}')
+    try:
+        d=json.load(open(f'/tmp/qwen38-final-p3-{i}-response.json'))
+        m=d.get('meta_info',{})
+        p=int(m.get('prompt_tokens') or 0)
+        c=int(m.get('completion_tokens') or 0)
+        print(f'req{i}_prompt_tokens={p}')
+        print(f'req{i}_completion_tokens={c}')
+        ok &= http=='200' and p==256 and c==8
+    except Exception as e:
+        print(f'req{i}_parse_error={e!r}')
+        ok=False
+print(f'parallel3_mamba_slot_pass={ok}')
+raise SystemExit(0 if ok else 1)
+PY
 
 echo '=== GPU STATE ==='
 nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,pstate --format=csv || true
