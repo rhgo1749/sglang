@@ -33,7 +33,7 @@ if ! grep -q 'nvfp4' "$HELP_OUT" || ! grep -q 'trtllm_mha' "$HELP_OUT"; then
   exit 1
 fi
 echo 'target: NVFP4 KV (FlashInfer prefill + TRTLLM-MHA decode, page_size=64)'
-echo 'CUDA2 draft: FP8 E4M3 KV (FlashInfer multi-step, private page_size=1)'
+echo 'CUDA2 draft: BF16 KV (FlashInfer multi-step, private page_size=1)'
 
 echo '=== APPLY AUTHORITATIVE CUTOVER ==='
 python3 tools/qwen38_mtp_sidecar_cutover.py --commit
@@ -46,13 +46,13 @@ python3 tools/qwen38_mtp_cutover_parallel3_hotfix.py --commit
 echo '=== HOTFIX PARALLEL POOL GATE ==='
 python3 tools/qwen38_mtp_cutover_pool_gate_hotfix.py --commit
 
-echo '=== HOTFIX NVFP4 TARGET / FP8 CUDA2 DRAFT ==='
+echo '=== HOTFIX NVFP4 TARGET / BF16 CUDA2 DRAFT ==='
 python3 tools/qwen38_mtp_cutover_nvfp4_target_hotfix.py --commit
 
 echo '=== HOTFIX CUDA2 SIDECAR PAGE_SIZE=1 ==='
 python3 tools/qwen38_mtp_cutover_sidecar_page1_hotfix.py --commit
 
-echo '=== RECREATE SERVER: NVFP4 TARGET KV, FP8 DRAFT KV, LOGICAL 256K x 3 ==='
+echo '=== RECREATE SERVER: NVFP4 TARGET KV, BF16 DRAFT KV, LOGICAL 256K x 3 ==='
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d \
@@ -101,7 +101,7 @@ echo "StartedAt: $STARTED"
 dump_failure() {
   echo '=== FAILURE SUMMARY ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory|NCCL|Connection closed' | \
+    grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|kv.cache|kv_cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Scheduler hit an exception|Traceback|Exception|RuntimeError|ValueError|AssertionError|AttributeError|CUDA error|illegal memory|out of memory|NCCL|Connection closed' | \
     tail -620 || true
   echo '=== FAILURE TAIL ==='
   docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -420 || true
@@ -124,15 +124,15 @@ fi
 echo '=== STARTUP GATES ==='
 START_LOG="$(mktemp)"
 docker logs --since "$STARTED" "$CONTAINER" >"$START_LOG" 2>&1 || true
-grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -420 || true
+grep -E 'MTP-CUTOVER|NVFP4|FP4|FP8|BF16|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|TRTLLM' "$START_LOG" | tail -420 || true
 
-if ! grep -q '\[MTP-CUTOVER-KV\] target=nvfp4 CUDA2 draft=fp8_e4m3' "$START_LOG"; then
-  echo 'ERROR: CUDA2 private FP8 draft-KV override did not activate'
+if ! grep -q '\[MTP-CUTOVER-KV\] target=nvfp4 CUDA2 draft=bfloat16' "$START_LOG"; then
+  echo 'ERROR: CUDA2 private BF16 draft-KV override did not activate'
   dump_failure
   exit 1
 fi
-if ! grep -q 'draft_kv_dtype=torch.float8_e4m3fn' "$START_LOG"; then
-  echo 'ERROR: CUDA2 draft runner did not resolve FP8 E4M3 KV'
+if ! grep -q 'draft_kv_dtype=torch.bfloat16' "$START_LOG"; then
+  echo 'ERROR: CUDA2 draft runner did not resolve BF16 KV'
   dump_failure
   exit 1
 fi
@@ -149,7 +149,7 @@ if [[ -z "$TARGET_TOKENS" || -z "$SIDE_TOKENS" ]]; then
   dump_failure
   exit 1
 fi
-printf 'target_kv=nvfp4\ntarget_page_size=64\ndraft_kv=fp8_e4m3\ndraft_page_size=1\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
+printf 'target_kv=nvfp4\ntarget_page_size=64\ndraft_kv=bfloat16\ndraft_page_size=1\ntarget_tokens=%s\nside_tokens=%s\nlogical_context_per_request=262144\nmax_running_requests=%s\n' \
   "$TARGET_TOKENS" "$SIDE_TOKENS" "$MAX_RUNNING"
 
 POOL_MIN="$TARGET_TOKENS"
@@ -249,4 +249,4 @@ grep -E 'MTP-CUTOVER-(REQ|PREFILL|DRAFT|EXTEND|KV|PAGE)|Prefill batch|Decode bat
 echo '=== CONTAINER STATUS ==='
 docker inspect -f 'running={{.State.Running}} status={{.State.Status}} exit={{.State.ExitCode}}' "$CONTAINER"
 
-echo 'MTP NVFP4-TARGET / FP8-DRAFT PARALLEL-3 SMOKE COMPLETE'
+echo 'MTP NVFP4-TARGET / BF16-DRAFT PARALLEL-3 SMOKE COMPLETE'
