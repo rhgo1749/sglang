@@ -9,8 +9,10 @@ export CONTAINER="${CONTAINER:-sglang-qwen38-gittensor-pp3}"
 export CTX="${CTX:-196608}"
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-196608}"
 
-# Vanilla validated baseline.
-export PARTITION="${PARTITION:-19,24,21}"
+# Native MTP + row-wise FP8 embedding candidate.  Compared with the validated
+# 19,24,21 split this moves five target layers off PP-last so PP2 drops from
+# six to four full-attention layers while PP0/PP1 absorb the target-only work.
+export PARTITION="${PARTITION:-20,28,16}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-593920}"
 
