@@ -12,6 +12,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_ownership.py /tmp/patch_mtp_pp_owner
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_req_source.py /tmp/patch_mtp_pp_req_source.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_mm_identity.py /tmp/patch_mtp_pp_mm_identity.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_spec_bridge.py /tmp/patch_mtp_pp_spec_bridge.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_prefill_bridge_final_chunk.py /tmp/patch_mtp_pp_prefill_bridge_final_chunk.py
 COPY tools/qwen38-pp-mtp-image/fix_mtp_pp_spec_bridge_installer.py /tmp/fix_mtp_pp_spec_bridge_installer.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_bridge_serializer.py /tmp/patch_mtp_pp_bridge_serializer.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_verify_nvfp4_metadata.py /tmp/patch_mtp_pp_verify_nvfp4_metadata.py
@@ -29,6 +30,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_mm_identity.py \
  && python3 /tmp/fix_mtp_pp_spec_bridge_installer.py \
  && python3 /tmp/patch_mtp_pp_spec_bridge.py \
+ && python3 /tmp/patch_mtp_pp_prefill_bridge_final_chunk.py \
  && python3 /tmp/patch_mtp_pp_bridge_serializer.py \
  && python3 /tmp/patch_mtp_pp_verify_nvfp4_metadata.py \
  && python3 /tmp/patch_mtp_pp_pool_profile.py \
@@ -53,6 +55,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_req_source.py \
       /tmp/patch_mtp_pp_mm_identity.py \
       /tmp/patch_mtp_pp_spec_bridge.py \
+      /tmp/patch_mtp_pp_prefill_bridge_final_chunk.py \
       /tmp/fix_mtp_pp_spec_bridge_installer.py \
       /tmp/patch_mtp_pp_bridge_serializer.py \
       /tmp/patch_mtp_pp_verify_nvfp4_metadata.py \
