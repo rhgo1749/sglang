@@ -1,5 +1,9 @@
 FROM lmsysorg/sglang:qwen38-27b
 
+# Diagnostic image: make the first failing CUDA op report at the real Python
+# call site instead of surfacing later at an unrelated synchronization point.
+ENV CUDA_LAUNCH_BLOCKING=1
+
 COPY tools/qwen38-pp-mtp-image/patch_pp_spec_guard.py /tmp/patch_pp_spec_guard.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_early_share.py /tmp/patch_mtp_early_share.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_prefill_input.py /tmp/patch_mtp_pp_prefill_input.py
