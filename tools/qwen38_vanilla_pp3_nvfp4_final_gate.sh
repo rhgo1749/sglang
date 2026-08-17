@@ -8,9 +8,10 @@ PORT="${PORT:-30000}"
 CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-3}"
 MAX_MAMBA="${MAX_MAMBA:-3}"
-# 19,23,22 fit the raw 3x256K KV pool, but PP2 exhausted runtime
-# headroom on the first functional request. Move one layer PP2 -> PP0.
-PARTITION="${PARTITION:-20,23,21}"
+# 19,23,22 is the only split so far that clears the raw 3x256K capacity gate.
+# Re-test it with expandable_segments enabled: the prior functional OOM had
+# substantial PyTorch reserved-but-unallocated memory and missed a 20 MiB alloc.
+PARTITION="${PARTITION:-19,23,22}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 REQUIRED=$((CTX * MAX_RUNNING))
