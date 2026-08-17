@@ -33,7 +33,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
-      /sgl-workspace/sglang/python/sglang/srt/model_executor/pool_configurator.py \
+      /sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_common.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py \
       /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_mtp.py \
