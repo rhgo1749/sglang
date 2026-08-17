@@ -8,6 +8,8 @@ fi
 
 CONTAINER="${CONTAINER:-sglang-qwen38-gittensor-pp3}"
 POLL_INTERVAL="${FAILFAST_POLL_INTERVAL:-0.5}"
+STALL_SECONDS="${FAILFAST_STALL_SECONDS:-0}"
+STALL_GPU_UTIL_MAX="${FAILFAST_STALL_GPU_UTIL_MAX:-5}"
 
 # Deliberately exclude known informational PP/spec messages such as
 # "Pipeline parallelism is incompatible with overlap schedule."  We only
@@ -23,6 +25,9 @@ trap 'rm -rf "$TMP"' EXIT
 BASE_CONTAINER_ID="$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null || true)"
 ACTIVE_CONTAINER_ID=""
 SEEN_RUNNING=0
+LAST_LOG_SIZE=0
+LAST_PROGRESS_AT="$(date +%s)"
+STALL_ARMED=0
 
 # Put the gate and all of its curl children in their own process group so a
 # detected server crash can terminate the waiting request immediately.
@@ -36,6 +41,10 @@ kill_child_group() {
     sleep 0.1
   done
   kill -KILL -- "-$CHILD" >/dev/null 2>&1 || true
+}
+
+cleanup_active_container() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 }
 
 capture_logs() {
@@ -86,6 +95,18 @@ dump_failure_log() {
   fi
 }
 
+all_gpus_idle() {
+  local utils
+  utils="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true)"
+  [[ -n "$utils" ]] || return 1
+  while IFS= read -r util; do
+    util="${util//[[:space:]]/}"
+    [[ "$util" =~ ^[0-9]+$ ]] || return 1
+    (( util <= STALL_GPU_UTIL_MAX )) || return 1
+  done <<<"$utils"
+  return 0
+}
+
 while kill -0 "$CHILD" >/dev/null 2>&1; do
   if docker inspect "$CONTAINER" >/dev/null 2>&1; then
     current_id="$(docker inspect -f '{{.Id}}' "$CONTAINER" 2>/dev/null || true)"
@@ -106,6 +127,17 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
     if [[ "$SEEN_RUNNING" == 1 && "$current_id" == "$ACTIVE_CONTAINER_ID" ]]; then
       capture_logs
 
+      if [[ -s "$TMP/log" ]]; then
+        log_size="$(wc -c <"$TMP/log")"
+        if (( log_size > LAST_LOG_SIZE )); then
+          LAST_LOG_SIZE="$log_size"
+          LAST_PROGRESS_AT="$(date +%s)"
+        fi
+        if grep -q 'Prefill batch' "$TMP/log"; then
+          STALL_ARMED=1
+        fi
+      fi
+
       if [[ -s "$TMP/log" ]] && grep -Eq "$FATAL_RE" "$TMP/log"; then
         echo
         echo 'FAILFAST_SERVER_ERROR=True'
@@ -113,7 +145,23 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
         capture_state
         kill_child_group
         dump_failure_log
+        cleanup_active_container
         exit 90
+      fi
+
+      if (( STALL_SECONDS > 0 && STALL_ARMED == 1 )); then
+        now="$(date +%s)"
+        idle_for=$((now - LAST_PROGRESS_AT))
+        if (( idle_for >= STALL_SECONDS )) && all_gpus_idle; then
+          echo
+          echo 'FAILFAST_SERVER_STALL=True'
+          echo "No server-log progress for ${idle_for}s and all GPUs <= ${STALL_GPU_UTIL_MAX}% utilization; treating the probe as stalled."
+          capture_state
+          kill_child_group
+          dump_failure_log
+          cleanup_active_container
+          exit 93
+        fi
       fi
 
       if [[ "$running" != true ]]; then
@@ -126,6 +174,7 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
         flush_exit_evidence
         kill_child_group
         dump_failure_log
+        cleanup_active_container
         exit 91
       fi
     fi
