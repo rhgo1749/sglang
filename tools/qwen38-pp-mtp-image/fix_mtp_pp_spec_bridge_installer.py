@@ -18,13 +18,25 @@ if needle not in s:
     raise RuntimeError("bridge installer class-offset patch point not found")
 s = s.replace(needle, replacement, 1)
 
-# patch_mtp_pp_spec_bridge.py contains the generated _pp_prep_batch_result body
-# inside a Python triple-quoted string. Search the PATCH SOURCE representation
-# (literal backslash-n sequences), not the generated target representation.
-future_old = r'''        _next_gpu = pp_outputs[\"next_token_ids\"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
-future_new = r'''        _next_gpu = pp_outputs[\"next_token_ids\"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
-if future_old not in s:
-    raise RuntimeError("bridge installer FutureMap patch-source point not found")
+# patch_mtp_pp_spec_bridge.py stores the generated method body in a Python
+# triple-quoted string. The source therefore contains literal backslash-n
+# sequences, but the quotes themselves are ordinary source quotes. Accept the
+# escaped-quote spelling too so this installer is insensitive to how the source
+# was generated/serialized.
+future_variants = [
+    r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n''',
+    r'''        _next_gpu = pp_outputs[\"next_token_ids\"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n''',
+]
+future_old = next((x for x in future_variants if x in s), None)
+if future_old is None:
+    # Give a useful diagnostic instead of another opaque exact-needle failure.
+    at = s.find('self.future_map.stash(')
+    excerpt = s[max(0, at - 180): at + 260] if at >= 0 else '<stash not found>'
+    raise RuntimeError(
+        "bridge installer FutureMap patch-source point not found; excerpt="
+        + repr(excerpt)
+    )
+future_new = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
 s = s.replace(future_old, future_new, 1)
 
 # Append semantic audits to the bridge patch itself. These run AFTER the bridge
@@ -67,4 +79,4 @@ print("VERIFIED sync PP spec bypasses FutureMap token stash")
 '''
 
 P.write_text(s)
-print("FIXED bridge installer signature, syntax, source escaping, offsets, FutureMap routing, and semantic audits")
+print("FIXED bridge installer signature, offsets, FutureMap routing, and semantic audits")
