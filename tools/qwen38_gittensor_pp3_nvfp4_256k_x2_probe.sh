@@ -14,15 +14,18 @@ export PARALLEL="${PARALLEL:-2}"
 export MAX_RUNNING="${MAX_RUNNING:-2}"
 export MAX_MAMBA="${MAX_MAMBA:-2}"
 
-# 24,28,12 successfully moved the long-prefill bottleneck off PP2: PP1 and PP2
-# both profile the full 524288-token cap, while PP0 alone falls to 473664.
-# Move only layer 23 (a full-attention layer) from PP0 to PP1, yielding
-# 23,29,12. The target full-attention distribution becomes 5/8/3. PP1 had
-# 8.39 GB local free budget versus PP0's 6.83 GB in the 24,28,12 probe, so it
-# is the measured stage with room to absorb that layer while PP2 stays at the
-# validated 12-layer / 3-full-attention geometry for MTP runtime headroom.
-export PARTITION="${PARTITION:-23,29,12}"
-# Keep the validated 2x256K memory policy; this probe changes only PP placement.
+# Measured structural balance for 2x256K:
+# - 22,28,14: all stages profile 524288, but PP2 draft NVFP4 dequant OOMs
+#   during long prefill (106 MiB allocation with ~100 MiB free).
+# - 24,28,12: PP1/PP2 reach 524288, PP0 falls to 473664 (6/7/3 full-attn).
+# - 23,29,12: PP0/PP2 reach 524288, PP1 falls to 506944 (5/8/3 full-attn).
+# 23,28,13 keeps PP0 at the already-passing 23-layer/5-full-attn geometry and
+# PP1 at an already-passing 28-layer/7-full-attn geometry. PP2 returns to four
+# full-attention layers, but carries one fewer target layer than the OOMing
+# 22,28,14 layout, recovering roughly one layer of persistent target memory for
+# the draft FlashInfer/NVFP4 runtime workspace. Treat this as the final measured
+# partition candidate before declaring exact 2x256K infeasible at this memory policy.
+export PARTITION="${PARTITION:-23,28,13}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-524288}"
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-512}"
