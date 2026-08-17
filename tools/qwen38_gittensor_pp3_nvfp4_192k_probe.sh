@@ -56,7 +56,8 @@ echo " capacity_gate=${CAPACITY_GATE}"
 echo " MTP ${MTP_DESC} / CUDA GRAPH OFF"
 echo '============================================================'
 
-bash "$ROOT_DIR/qwen38_vanilla_pp3_nvfp4_final_gate.sh"
+bash "$ROOT_DIR/qwen38_failfast_watch.sh" \
+  bash "$ROOT_DIR/qwen38_vanilla_pp3_nvfp4_final_gate.sh"
 
 echo
 echo '=== LOAD / MEMORY / MTP SUMMARY ==='
