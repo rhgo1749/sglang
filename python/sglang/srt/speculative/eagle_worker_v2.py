@@ -1372,7 +1372,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ):
                 if not hasattr(self, "_mtp_sidecar_draft_attn_backend"):
                     _side_factory = DraftBackendFactory(
-                        self.server_args,
                         mr,
                         self.topk,
                         self.speculative_num_steps,
