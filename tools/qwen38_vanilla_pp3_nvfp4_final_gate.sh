@@ -9,10 +9,9 @@ CTX="${CTX:-262144}"
 MAX_RUNNING="${MAX_RUNNING:-3}"
 MAX_MAMBA="${MAX_MAMBA:-3}"
 # 19,23,22 is the only split so far that clears the raw 3x256K capacity gate.
-# Re-test it with expandable_segments enabled: the prior functional OOM had
-# substantial PyTorch reserved-but-unallocated memory and missed a 20 MiB alloc.
 PARTITION="${PARTITION:-19,23,22}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 REQUIRED=$((CTX * MAX_RUNNING))
 
@@ -36,6 +35,7 @@ echo '============================================================'
 echo ' QWEN3.8 FINAL VANILLA PP3 + NVFP4 RAW 3x256K GATE'
 echo " partition=${PARTITION}"
 echo " mem_fraction_static=${MEM_FRACTION_STATIC}"
+echo " chunked_prefill_size=${CHUNKED_PREFILL_SIZE}"
 echo " pytorch_cuda_alloc_conf=${PYTORCH_CUDA_ALLOC_CONF}"
 echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
@@ -81,7 +81,7 @@ docker run -d \
     --mamba-radix-cache-strategy extra_buffer_lazy \
     --disable-radix-cache \
     --mm-feature-transport cpu \
-    --chunked-prefill-size 2048 \
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
     --disable-cuda-graph \
     --disable-flashinfer-autotune \
     --reasoning-parser qwen3 \
