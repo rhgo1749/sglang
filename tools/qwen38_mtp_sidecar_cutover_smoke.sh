@@ -6,6 +6,11 @@ PATCH_DIR="${HOME}/projects/sglang-patches"
 CONTAINER="sglang-qwen38-test"
 IMAGE="lmsysorg/sglang:qwen38-27b"
 MODEL="RadixArk/Qwen3.8-27B-NVFP4"
+# With the colocated draft removed, 0.95 lets the target KV pool consume nearly
+# all reclaimed VRAM before the target-verify CUDA graph is captured.  Keep a
+# conservative graph/eager workspace reserve for the authoritative cutover gate.
+# The runtime cutover itself still fail-fast checks target/sidecar pools >=64K.
+MEM_FRACTION_STATIC="${MTP_CUTOVER_MEM_FRACTION_STATIC:-0.80}"
 
 cd "$REPO"
 
@@ -15,7 +20,7 @@ python3 tools/qwen38_mtp_sidecar_cutover.py --commit
 echo '=== HOTFIX NESTED PP CONTEXT ==='
 python3 tools/qwen38_mtp_cutover_pp_hotfix.py
 
-echo '=== RECREATE SERVER ==='
+echo "=== RECREATE SERVER (mem_fraction_static=${MEM_FRACTION_STATIC}) ==="
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
 docker run -d \
@@ -35,7 +40,7 @@ docker run -d \
     --tp 2 \
     --trust-remote-code \
     --context-length 262144 \
-    --mem-fraction-static 0.95 \
+    --mem-fraction-static "$MEM_FRACTION_STATIC" \
     --max-running-requests 1 \
     --max-mamba-cache-size 8 \
     --mamba-ssm-dtype bfloat16 \
@@ -69,14 +74,19 @@ while true; do
 done
 '; then
   echo 'SERVER DID NOT BECOME READY'
-  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -300
+  echo '=== FAILURE MEMORY / CUTOVER SUMMARY ==='
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
+    grep -E 'MTP-CUTOVER|Load weight end|Mamba Cache|KV Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|Capture target verify CUDA graph|OutOfMemory|out of memory|Scheduler hit an exception|Traceback' | \
+    tail -220 || true
+  echo '=== FAILURE TAIL ==='
+  docker logs --since "$STARTED" "$CONTAINER" 2>&1 | tail -180
   exit 1
 fi
 
 echo '=== STARTUP CUTOVER GATES ==='
 docker logs --since "$STARTED" "$CONTAINER" 2>&1 | \
-  grep -E 'MTP-CUTOVER|MTP-SIDECAR|target_tokens|max_total_num_tokens|Scheduler hit an exception|Traceback' | \
-  tail -180 || true
+  grep -E 'MTP-CUTOVER|MTP-SIDECAR|target_tokens|max_total_num_tokens|Memory pool end|available_gpu_mem|Scheduler hit an exception|Traceback' | \
+  tail -220 || true
 
 echo '=== MULTI-ITERATION DECODE ==='
 curl -fsS \
