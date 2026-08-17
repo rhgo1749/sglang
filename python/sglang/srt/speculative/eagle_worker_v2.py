@@ -310,6 +310,45 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 mr = self.draft_runner
                 self.req_to_token_pool = mr.req_to_token_pool
                 self.token_to_kv_pool_allocator = mr.token_to_kv_pool_allocator
+
+                # A colocated EAGLE draft shares the target HybridReqToTokenPool,
+                # whose extra-buffer ping-pong mapping is created by the target
+                # pool.  This CUDA2 draft owns an independent draft-worker pool;
+                # exact-image builds can therefore omit that mapping even though
+                # the process-wide Mamba strategy is extra_buffer_lazy.  Promote
+                # the sidecar pool to the same lazy tracking contract before its
+                # first Req allocation.  HybridReqToTokenPool.alloc() then owns
+                # the actual ping-pong slot allocation and mapping updates.
+                if (
+                    hasattr(self.req_to_token_pool, "mamba_pool")
+                    and not hasattr(
+                        self.req_to_token_pool,
+                        "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                    )
+                ):
+                    _side_pool = self.req_to_token_pool
+                    _side_pool.enable_mamba_extra_buffer = True
+                    _side_pool.enable_mamba_extra_buffer_lazy = True
+                    if not hasattr(_side_pool, "mamba_ping_pong_track_buffer_size"):
+                        _side_pool.mamba_ping_pong_track_buffer_size = 2
+                    _side_pool.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                        torch.zeros(
+                            (
+                                _side_pool.req_to_token.shape[0],
+                                _side_pool.mamba_ping_pong_track_buffer_size,
+                            ),
+                            dtype=torch.int64,
+                            device=_side_pool.device,
+                        )
+                    )
+                    logger.info(
+                        "[MTP-CUTOVER-MAMBA] CUDA%d installed lazy ping-pong "
+                        "tracking rows=%d width=%d mamba_slots=%d",
+                        self.gpu_id,
+                        _side_pool.req_to_token.shape[0],
+                        _side_pool.mamba_ping_pong_track_buffer_size,
+                        _side_pool.mamba_pool.size,
+                    )
                 if int(mr.max_total_num_tokens) < 65536:
                     raise RuntimeError(
                         f"CUDA2 MTP pool too small for cutover: "
