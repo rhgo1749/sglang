@@ -517,12 +517,11 @@ def patch_eagle(path: Path) -> None:
             )
             try:
                 torch.cuda.set_device(sidecar_gpu_id)
-                with (
-                    _mtp_sidecar_parallel_context(get_self_pp_group()),
-                    draft_pp_context(),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                ):
+                # EagleDraftWorker.__init__ owns draft_pp_context and the
+                # speculative MoE contexts itself.  The PP patcher is deliberately
+                # non-reentrant, so the outer worker must establish only the TP1 /
+                # attention topology required while the sidecar modules are built.
+                with _mtp_sidecar_parallel_context(get_self_pp_group()):
                     self._draft_worker = EagleDraftWorker(
                         server_args,
                         sidecar_gpu_id,
