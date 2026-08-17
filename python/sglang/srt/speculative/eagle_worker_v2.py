@@ -1290,6 +1290,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ).item()
             )
 
+            # Save a tiny one-shot correctness snapshot on host memory.  The
+            # authoritative colocated draft runs immediately after this helper
+            # on the same logical prefill.  Host staging deliberately avoids
+            # CUDA2->CUDA0 P2P/IPC assumptions while we validate equivalence.
+            self._mtp_sidecar_shadow_compare = {
+                "logits": side_logits.next_token_logits.detach().float().cpu(),
+                "hidden": (
+                    side_logits.hidden_states.detach().float().cpu()
+                    if side_logits.hidden_states is not None
+                    else None
+                ),
+                "argmax": probe_token,
+            }
+
             logger.info(
                 "[MTP-SIDECAR-SHADOW] eager prefill SUCCESS "
                 "CUDA%d req_row=%d seq_len=%d extend=%d "
@@ -1410,6 +1424,91 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+
+        # One-shot numerical comparison between the CUDA2 TP1 sidecar and the
+        # authoritative colocated draft.  Both consumed the same shifted token
+        # stream and target hidden states.  MTP uses top-k=1 here, so top1
+        # agreement is the primary semantic check; cosine / absolute deltas
+        # expose subtler loader or TP-sharding mistakes before replacement.
+        _side_cmp = getattr(self, "_mtp_sidecar_shadow_compare", None)
+        if _side_cmp is not None:
+            try:
+                _stock_logits = logits_output.next_token_logits.detach().float().cpu()
+                _side_logits_cpu = _side_cmp["logits"]
+
+                if _stock_logits.shape != _side_logits_cpu.shape:
+                    logger.error(
+                        "[MTP-SIDECAR-COMPARE] SHAPE_MISMATCH side=%s stock=%s",
+                        tuple(_side_logits_cpu.shape),
+                        tuple(_stock_logits.shape),
+                    )
+                else:
+                    _delta = (_side_logits_cpu - _stock_logits).abs()
+                    _side_flat = _side_logits_cpu.reshape(-1)
+                    _stock_flat = _stock_logits.reshape(-1)
+                    _logit_cos = torch.nn.functional.cosine_similarity(
+                        _side_flat, _stock_flat, dim=0
+                    ).item()
+
+                    _side_argmax = int(torch.argmax(_side_logits_cpu[-1]).item())
+                    _stock_argmax = int(torch.argmax(_stock_logits[-1]).item())
+                    _k = min(5, _stock_logits.shape[-1])
+                    _side_top5 = set(
+                        torch.topk(_side_logits_cpu[-1], k=_k).indices.tolist()
+                    )
+                    _stock_top5 = set(
+                        torch.topk(_stock_logits[-1], k=_k).indices.tolist()
+                    )
+
+                    _hidden_cos = None
+                    _hidden_max_abs = None
+                    _side_hidden = _side_cmp.get("hidden")
+                    _stock_hidden = (
+                        logits_output.hidden_states.detach().float().cpu()
+                        if logits_output.hidden_states is not None
+                        else None
+                    )
+                    if (
+                        _side_hidden is not None
+                        and _stock_hidden is not None
+                        and _side_hidden.shape == _stock_hidden.shape
+                    ):
+                        _hidden_cos = torch.nn.functional.cosine_similarity(
+                            _side_hidden.reshape(-1),
+                            _stock_hidden.reshape(-1),
+                            dim=0,
+                        ).item()
+                        _hidden_max_abs = (
+                            (_side_hidden - _stock_hidden).abs().max().item()
+                        )
+
+                    logger.info(
+                        "[MTP-SIDECAR-COMPARE] "
+                        "shape=%s side_argmax=%d stock_argmax=%d top1_match=%s "
+                        "top5_overlap=%d logit_cosine=%.9f "
+                        "max_abs=%.7g mean_abs=%.7g "
+                        "hidden_cosine=%s hidden_max_abs=%s",
+                        tuple(_stock_logits.shape),
+                        _side_argmax,
+                        _stock_argmax,
+                        _side_argmax == _stock_argmax,
+                        len(_side_top5 & _stock_top5),
+                        _logit_cos,
+                        _delta.max().item(),
+                        _delta.mean().item(),
+                        (
+                            f"{_hidden_cos:.9f}"
+                            if _hidden_cos is not None
+                            else None
+                        ),
+                        (
+                            f"{_hidden_max_abs:.7g}"
+                            if _hidden_max_abs is not None
+                            else None
+                        ),
+                    )
+            finally:
+                self._mtp_sidecar_shadow_compare = None
 
         prefill_dsa_topk = None
         if seed_from_extend:
