@@ -9,39 +9,49 @@ if needle not in s:
     raise RuntimeError("bridge installer class-offset patch point not found")
 s = s.replace(needle, replacement, 1)
 
-# Synchronous speculative decoding installs next_draft_input directly; it does
-# not use FutureMap for next-token relay. PP-last's result may already be on CPU
-# after copy_to_cpu(), so never feed that CPU tensor into the GPU FutureMap.
-future_old = '''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
-future_new = '''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
+# patch_mtp_pp_spec_bridge.py contains the generated _pp_prep_batch_result body
+# inside a Python triple-quoted string.  Search the PATCH SOURCE representation
+# (literal backslash-n sequences), not the generated target representation.
+future_old = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
+future_new = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
 if future_old not in s:
-    raise RuntimeError("bridge installer FutureMap patch point not found")
+    raise RuntimeError("bridge installer FutureMap patch-source point not found")
 s = s.replace(future_old, future_new, 1)
 
-# Append a semantic audit in addition to py_compile: the helper calls verify with
-# pp_proxy_tensors, so its actual EAGLEWorkerV2.verify signature must accept it.
+# Append semantic audits to the bridge patch itself. These run AFTER the bridge
+# has modified the base-image files, so build failure points at a real semantic
+# mismatch rather than allowing a half-installed image.
 s += r'''
 
 # Installer semantic audit added by fix_mtp_pp_spec_bridge_installer.py
 _e = EAGLE.read_text()
 _ca = _e.find("class EAGLEWorkerV2(")
+if _ca < 0:
+    raise RuntimeError("semantic audit: EAGLEWorkerV2 missing")
 _va = _e.find("    def verify(", _ca)
-_ve = _e.find("\n    def ", _va + 8)
+if _va < 0:
+    raise RuntimeError("semantic audit: EAGLEWorkerV2.verify missing")
+_ve = _e.find("\n    def ", _va + len("    def verify("))
 if _ve < 0:
     _ve = len(_e)
 _vf = _e[_va:_ve]
-if _va < 0 or "pp_proxy_tensors=None" not in _vf.split(":", 1)[0]:
+_header_end = _vf.find("):")
+if _header_end < 0:
+    raise RuntimeError("semantic audit: EAGLEWorkerV2.verify header terminator missing")
+_vheader = _vf[: _header_end + 2]
+if "pp_proxy_tensors=None" not in _vheader:
     raise RuntimeError("EAGLEWorkerV2.verify did not gain pp_proxy_tensors")
 if "pp_proxy_tensors=pp_proxy_tensors" not in _vf:
     raise RuntimeError("EAGLEWorkerV2.verify did not forward pp_proxy_tensors")
 
 _p = PP.read_text()
-if 'if batch.spec_algorithm.is_none():\n            self.future_map.stash(' not in _p:
-    raise RuntimeError("sync PP spec still writes into FutureMap")
+_future_guard = '''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n'''
+if _future_guard not in _p:
+    raise RuntimeError("sync PP spec still writes unconditionally into FutureMap")
 
 print("VERIFIED EAGLEWorkerV2.verify PP proxy signature")
 print("VERIFIED sync PP spec bypasses FutureMap token stash")
 '''
 
 P.write_text(s)
-print("FIXED bridge installer offsets, FutureMap routing, and semantic audits")
+print("FIXED bridge installer source escaping, offsets, FutureMap routing, and semantic audits")
