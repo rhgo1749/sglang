@@ -3,6 +3,15 @@ from pathlib import Path
 P = Path("/tmp/patch_mtp_pp_spec_bridge.py")
 s = P.read_text()
 
+# The qwen38-27b base's shared verify helper includes num_steps between topk
+# and num_draft_tokens. Keep the generated bridge signature aligned with the
+# actual helper instead of matching the older signature shape.
+sig_old = '    topk: int,\\n    num_draft_tokens: int,\\n'
+sig_new = '    topk: int,\\n    num_steps: int,\\n    num_draft_tokens: int,\\n'
+if sig_old not in s:
+    raise RuntimeError("bridge installer run_eagle_verify signature source point not found")
+s = s.replace(sig_old, sig_new, 1)
+
 needle = '''# The current base normally imports build_eagle_verify_input already. Fail fast\n# rather than silently calling an unavailable helper.\nif "build_eagle_verify_input" not in s[:class_at]:\n    raise RuntimeError("build_eagle_verify_input import missing from EAGLE worker")\n\nhelper_marker = "[MTP-PP-SPEC-BRIDGE]"\n'''
 replacement = '''# Import edits above change every later byte offset. Re-resolve the actual class\n# and method before inserting helpers; never reuse pre-edit string offsets.\nclass_at = s.find("class EAGLEWorkerV2(")\nif class_at < 0:\n    raise RuntimeError("class EAGLEWorkerV2 disappeared after import patch")\nfn_at = s.find("    def forward_batch_generation(", class_at)\nif fn_at < 0:\n    raise RuntimeError("EAGLEWorkerV2.forward_batch_generation disappeared after import patch")\n\n# The current base normally imports build_eagle_verify_input already. Fail fast\n# rather than silently calling an unavailable helper.\nif "build_eagle_verify_input" not in s[:class_at]:\n    raise RuntimeError("build_eagle_verify_input import missing from EAGLE worker")\n\nhelper_marker = "[MTP-PP-SPEC-BRIDGE]"\n'''
 if needle not in s:
@@ -12,8 +21,8 @@ s = s.replace(needle, replacement, 1)
 # patch_mtp_pp_spec_bridge.py contains the generated _pp_prep_batch_result body
 # inside a Python triple-quoted string. Search the PATCH SOURCE representation
 # (literal backslash-n sequences), not the generated target representation.
-future_old = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
-future_new = r'''        _next_gpu = pp_outputs["next_token_ids"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
+future_old = r'''        _next_gpu = pp_outputs[\"next_token_ids\"].to(torch.int64)\n        self.future_map.stash(\n            batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n        )\n        batch.input_ids = None\n'''
+future_new = r'''        _next_gpu = pp_outputs[\"next_token_ids\"].to(torch.int64)\n        if batch.spec_algorithm.is_none():\n            self.future_map.stash(\n                batch.req_pool_indices, RelayPayload(bonus_tokens=_next_gpu)\n            )\n        batch.input_ids = None\n'''
 if future_old not in s:
     raise RuntimeError("bridge installer FutureMap patch-source point not found")
 s = s.replace(future_old, future_new, 1)
@@ -58,4 +67,4 @@ print("VERIFIED sync PP spec bypasses FutureMap token stash")
 '''
 
 P.write_text(s)
-print("FIXED bridge installer syntax, source escaping, offsets, FutureMap routing, and semantic audits")
+print("FIXED bridge installer signature, syntax, source escaping, offsets, FutureMap routing, and semantic audits")
