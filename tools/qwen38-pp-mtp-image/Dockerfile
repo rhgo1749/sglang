@@ -17,6 +17,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_ownership.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
+      /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py \
       /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_mtp.py \
  && rm \
