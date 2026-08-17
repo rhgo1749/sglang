@@ -10,14 +10,15 @@ export CTX="${CTX:-196608}"
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-196608}"
 
 # Native MTP + row-wise FP8 embedding candidate.
-# 23,27,14 keeps the full-attention distribution at 5/7/4 while moving only
-# linear-attention layers: PP0 absorbs three linear layers, PP1 sheds one net
-# linear layer, and PP2 sheds two. This preserves KV bytes/token while freeing
-# target-weight/Mamba headroom on the two stages that limited 20,28,16.
-export PARTITION="${PARTITION:-23,27,14}"
+# 22,28,14 is a one-layer refinement of 23,27,14: move only target layer 22
+# from PP0 to PP1. Layer 22 is linear-attention, so the full-attention
+# distribution stays 5/7/4 and KV bytes/token do not increase. This targets
+# the only remaining local-capacity bottleneck (PP0=555328) while PP1/PP2
+# already reach the exact 3x196608 cap.
+export PARTITION="${PARTITION:-22,28,14}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
-# Exact 3 x 196608 target. Do not reserve the old extra 4096 tokens while PP2
-# is still tight enough that FlashInfer draft-backend workspace matters.
+# Exact 3 x 196608 target. Keep the old extra 4096-token reserve disabled while
+# validating the native MTP capacity and post-pool backend headroom.
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-589824}"
 
 export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
