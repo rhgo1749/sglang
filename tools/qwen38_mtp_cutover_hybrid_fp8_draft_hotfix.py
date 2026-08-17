@@ -51,7 +51,6 @@ def _patch_private_args(text: str, path: pathlib.Path):
         '                        _side_server_args, "decode_attention_backend", "trtllm_mha"',
         '                        _side_server_args, "decode_attention_backend", "flashinfer"',
     )
-    # Prefill is already FlashInfer in the NVFP4 A/B block; keep it explicit.
     block = block.replace(
         '"[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=nvfp4"',
         '"[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=fp8_e4m3"',
@@ -85,8 +84,6 @@ def patch(path: pathlib.Path) -> bool:
     text = path.read_text()
     changed = False
 
-    # FlashInfer multi-step draft uses token-level page bookkeeping.  The target
-    # remains page64/TRTLLM; only the in-process CUDA2 RuntimeContext is page1.
     text, c = _replace_or_keep(
         text,
         "get_schedule().override(page_size=64),",
@@ -115,9 +112,6 @@ def patch(path: pathlib.Path) -> bool:
         )
         changed = True
 
-    # Keep the high-water allocator: with page1 it is still correct and avoids
-    # churn from alloc/free of 3/4-token speculative tails.  It also lets us
-    # switch the A/B back to page64 later without rewriting request lifetime code.
     if '"[MTP-CUTOVER-PAGED] CUDA%d page_size=%d high-water allocator enabled"' in text:
         text = text.replace(
             '"[MTP-CUTOVER-PAGED] CUDA%d page_size=%d high-water allocator enabled"',
@@ -126,7 +120,6 @@ def patch(path: pathlib.Path) -> bool:
         )
         old_args = '''                    self.gpu_id,\n                    int(mr.page_size),\n                )'''
         new_args = '''                    self.gpu_id,\n                    int(mr.page_size),\n                    type(mr.token_to_kv_pool_allocator).__name__,\n                )'''
-        # Only alter the argument list belonging to the marker we just renamed.
         marker_pos = text.find('[MTP-CUTOVER-HIGHWATER]')
         arg_pos = text.find(old_args, marker_pos)
         if arg_pos < 0:
@@ -145,8 +138,6 @@ def patch(path: pathlib.Path) -> bool:
         1,
     )
 
-    # Hard postconditions: target-side code is untouched, while CUDA2 resolves to
-    # FP8 + FlashInfer + page1.  The per-request high-water state intentionally stays.
     for needle in (
         HYBRID_MARKER.strip("'"),
         'get_schedule().override(page_size=1)',
@@ -182,11 +173,8 @@ def main() -> None:
     )
 
     if args.commit and fork_changed:
-        subprocess.run(
-            ["git", "add", str(FORK.relative_to(REPO))], cwd=REPO, check=True
-        )
-        diff = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"], cwd=REPO, check=False
+        subprocess.run(["git", "add", str(FORK.relative_to(REPO))], cwd=REPO, check=True)
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=REPO, check=False)
         if diff.returncode != 0:
             subprocess.run(
                 [
