@@ -1359,10 +1359,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # once.  Do not borrow the colocated draft backend: it owns CUDA0
             # buffers and TP2 construction state.
             side_batch.spec_info = _side_draft_input
-            side_batch.forward_mode = batch.forward_mode
+            from sglang.srt.model_executor.forward_batch_info import ForwardMode as _ForwardMode
+
+            side_batch.forward_mode = _ForwardMode.DECODE
+            side_batch.input_ids = _side_initial_token.reshape(-1)
             side_batch.seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
             side_batch.seq_lens = side_batch.seq_lens_cpu.to(sidecar_device)
             side_batch.seq_lens_sum = seq_len
+            logger.info(
+                "[MTP-SIDECAR-DECODE-VIEW] mode=%s input_shape=%s seq_len=%d",
+                side_batch.forward_mode,
+                tuple(side_batch.input_ids.shape),
+                seq_len,
+            )
 
             with (
                 _mtp_sidecar_parallel_context(get_self_pp_group()),
