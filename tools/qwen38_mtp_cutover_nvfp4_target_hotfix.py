@@ -17,18 +17,25 @@ NEW = '''                # NVFP4 target decode is served by TRTLLM MHA, while th
 LOG_OLD = '''                mr = self.draft_runner\n                self.req_to_token_pool = mr.req_to_token_pool\n'''
 LOG_NEW = '''                mr = self.draft_runner\n                logger.info(\n                    "[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s",\n                    self.gpu_id,\n                    str(getattr(mr, "kv_cache_dtype", None)),\n                    str(getattr(mr, "kv_cache_dtype_str", None)),\n                )\n                self.req_to_token_pool = mr.req_to_token_pool\n'''
 
+CONSTRUCTION_MARKER = '"[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=fp8_e4m3"'
+LOG_MARKER = '"[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s"'
+
 
 def patch(path: pathlib.Path) -> bool:
     text = path.read_text()
     changed = False
 
-    if NEW not in text:
+    # Later page-size isolation intentionally rewrites the private ServerArgs
+    # stanza while preserving this marker.  Treat that composed form as already
+    # installed instead of requiring the byte-exact pre-page1 template.
+    if CONSTRUCTION_MARKER not in text:
         if OLD not in text:
             raise RuntimeError(f"NVFP4 sidecar construction patch point not found: {path}")
         text = text.replace(OLD, NEW, 1)
         changed = True
 
-    if LOG_NEW not in text:
+    # Same for the page-size invariant inserted between `mr = ...` and this log.
+    if LOG_MARKER not in text:
         if LOG_OLD not in text:
             raise RuntimeError(f"NVFP4 sidecar KV log patch point not found: {path}")
         text = text.replace(LOG_OLD, LOG_NEW, 1)
