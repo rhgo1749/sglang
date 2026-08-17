@@ -14,14 +14,14 @@ export PARALLEL="${PARALLEL:-2}"
 export MAX_RUNNING="${MAX_RUNNING:-2}"
 export MAX_MAMBA="${MAX_MAMBA:-2}"
 
-# 2x256K reaches the exact 524288-token pool with 22,28,14, but PP2 still
-# OOMs during draft NVFP4 dequantization: a 106 MiB allocation sees only
-# ~100 MiB free around 109K prefill. Move layers 22-23 onto PP0 and layers
-# 50-51 onto PP1, yielding 24,28,12. With full-attention every fourth layer,
-# the target full-attention distribution changes from 5/7/4 to 6/7/3. This
-# removes one full-attention KV layer plus two target layers from PP2 without
-# increasing PP1's full-attention count, preserving the exact 2x256K pool.
-export PARTITION="${PARTITION:-24,28,12}"
+# 24,28,12 successfully moved the long-prefill bottleneck off PP2: PP1 and PP2
+# both profile the full 524288-token cap, while PP0 alone falls to 473664.
+# Move only layer 23 (a full-attention layer) from PP0 to PP1, yielding
+# 23,29,12. The target full-attention distribution becomes 5/8/3. PP1 had
+# 8.39 GB local free budget versus PP0's 6.83 GB in the 24,28,12 probe, so it
+# is the measured stage with room to absorb that layer while PP2 stays at the
+# validated 12-layer / 3-full-attention geometry for MTP runtime headroom.
+export PARTITION="${PARTITION:-23,29,12}"
 # Keep the validated 2x256K memory policy; this probe changes only PP placement.
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.84}"
 export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-524288}"
