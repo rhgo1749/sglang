@@ -14,6 +14,21 @@ REQUEST_TIMEOUT="${MTP_P3_REQUEST_TIMEOUT:-180}"
 
 cd "$REPO"
 
+echo '=== PREFLIGHT HOTFIX PYTHON SYNTAX ==='
+HOTFIX_PY=(
+  tools/qwen38_mtp_sidecar_cutover.py
+  tools/qwen38_mtp_cutover_pp_hotfix.py
+  tools/qwen38_mtp_cutover_mamba_tracking_hotfix.py
+  tools/qwen38_mtp_cutover_parallel3_hotfix.py
+  tools/qwen38_mtp_cutover_pool_gate_hotfix.py
+  tools/qwen38_mtp_cutover_nvfp4_target_hotfix.py
+  tools/qwen38_mtp_cutover_sidecar_page1_hotfix.py
+)
+for py in "${HOTFIX_PY[@]}"; do
+  python3 -m py_compile "$py"
+done
+echo 'hotfix syntax: OK'
+
 echo '=== PREFLIGHT EXACT IMAGE NVFP4 TARGET ABI ==='
 HELP_OUT="$(mktemp)"
 if ! docker run --rm "$IMAGE" python3 -m sglang.launch_server --help >"$HELP_OUT" 2>&1; then
