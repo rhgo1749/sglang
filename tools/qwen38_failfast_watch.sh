@@ -22,6 +22,11 @@ trap 'rm -rf "$TMP"' EXIT
 setsid "$@" &
 CHILD=$!
 
+# The probe deliberately removes any stale container at startup.  Do not treat
+# that cleanup transition as a crash.  Container-exit detection is armed only
+# after this watchdog has observed the newly launched container in Running=true.
+SEEN_RUNNING=0
+
 kill_child_group() {
   kill -TERM -- "-$CHILD" >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5; do
@@ -33,19 +38,37 @@ kill_child_group() {
 
 dump_failure_log() {
   echo '=== IMMEDIATE FAILURE SUMMARY ==='
-  grep -Ei 'PP[0-9]|MTP|speculative|Scheduler hit an exception|Traceback|AssertionError|RuntimeError|ValueError|CUDA error|out of memory|Exception triggered' "$TMP/log" | tail -80 || true
-  echo
-  echo '=== IMMEDIATE FAILURE RAW TAIL ==='
-  # Do not grep the traceback here: Python continuation frames and the final
-  # exception message often do not contain any of the summary keywords.
-  tail -260 "$TMP/log" || true
+  if [[ -s "$TMP/log" ]]; then
+    grep -Ei 'PP[0-9]|MTP|speculative|Scheduler hit an exception|Traceback|AssertionError|RuntimeError|ValueError|CUDA error|out of memory|Exception triggered' "$TMP/log" | tail -80 || true
+    echo
+    echo '=== IMMEDIATE FAILURE RAW TAIL ==='
+    # Do not grep the traceback here: Python continuation frames and the final
+    # exception message often do not contain any of the summary keywords.
+    tail -260 "$TMP/log" || true
+  else
+    echo '(no container log captured)'
+  fi
 }
 
 while kill -0 "$CHILD" >/dev/null 2>&1; do
   if docker inspect "$CONTAINER" >/dev/null 2>&1; then
-    docker logs "$CONTAINER" >"$TMP/log" 2>&1 || true
+    running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
 
-    if grep -Eq "$FATAL_RE" "$TMP/log"; then
+    if [[ "$running" == true ]]; then
+      SEEN_RUNNING=1
+    fi
+
+    # A container can briefly be marked for removal while startup cleanup is
+    # racing with this watcher.  Capture logs only when Docker can actually
+    # serve them; keep the last good copy otherwise.
+    docker logs "$CONTAINER" >"$TMP/log.new" 2>&1 || true
+    if [[ -s "$TMP/log.new" ]] && ! grep -q '^Error response from daemon:' "$TMP/log.new"; then
+      mv "$TMP/log.new" "$TMP/log"
+    else
+      rm -f "$TMP/log.new"
+    fi
+
+    if [[ -s "$TMP/log" ]] && grep -Eq "$FATAL_RE" "$TMP/log"; then
       echo
       echo 'FAILFAST_SERVER_ERROR=True'
       echo 'Detected fatal scheduler/worker error; aborting the waiting request.'
@@ -54,11 +77,10 @@ while kill -0 "$CHILD" >/dev/null 2>&1; do
       exit 90
     fi
 
-    running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
-    if [[ "$running" != true ]]; then
+    if [[ "$SEEN_RUNNING" == 1 && "$running" != true ]]; then
       echo
       echo 'FAILFAST_CONTAINER_EXIT=True'
-      echo 'Container exited while the probe was still waiting.'
+      echo 'Container exited after the probe had observed it running.'
       kill_child_group
       dump_failure_log
       exit 91
