@@ -315,6 +315,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
 
                 mr = self.draft_runner
+                logger.info(
+                    "[MTP-CUTOVER-KV] CUDA%d draft_kv_dtype=%s draft_kv_tag=%s",
+                    self.gpu_id,
+                    str(getattr(mr, "kv_cache_dtype", None)),
+                    str(getattr(mr, "kv_cache_dtype_str", None)),
+                )
                 self.req_to_token_pool = mr.req_to_token_pool
                 self.token_to_kv_pool_allocator = mr.token_to_kv_pool_allocator
 
@@ -2566,9 +2572,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # speculative MoE contexts itself.  The PP patcher is deliberately
                 # non-reentrant, so the outer worker must establish only the TP1 /
                 # attention topology required while the sidecar modules are built.
+                # NVFP4 target decode is served by TRTLLM MHA, while the CUDA2
+                # EAGLE draft keeps the already-proven FlashInfer multi-step path.
+                # The exact image predates --speculative-draft-kv-cache-dtype, so
+                # give only the in-process sidecar a private ServerArgs view with
+                # FP8 E4M3 KV. Never mutate the published target ServerArgs.
+                import copy as _mtp_copy
+
+                _side_server_args = server_args
+                if getattr(server_args, "kv_cache_dtype", None) == "nvfp4":
+                    _side_server_args = _mtp_copy.copy(server_args)
+                    object.__setattr__(
+                        _side_server_args, "kv_cache_dtype", "fp8_e4m3"
+                    )
+                    logger.info(
+                        "[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=fp8_e4m3",
+                        sidecar_gpu_id,
+                    )
+
                 with _mtp_sidecar_parallel_context(get_self_pp_group()):
                     self._draft_worker = EagleDraftWorker(
-                        server_args,
+                        _side_server_args,
                         sidecar_gpu_id,
                         sidecar_ps,
                         nccl_port,
