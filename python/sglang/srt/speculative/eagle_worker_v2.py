@@ -1371,12 +1371,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 speculative_moe_a2a_backend_context(),
             ):
                 if not hasattr(self, "_mtp_sidecar_draft_attn_backend"):
-                    _side_factory = DraftBackendFactory(
-                        mr,
-                        self.topk,
-                        self.speculative_num_steps,
-                        seed_dsa_topk_from_draft_extend=False,
+                    # This WIP file is mounted into an exact Docker image while
+                    # the fork around it can be a newer SGLang revision.
+                    # DraftBackendFactory changed constructor shape between
+                    # those revisions, so resolve it from the runtime class
+                    # instead of hard-coding either ABI.
+                    import inspect as _inspect
+
+                    _factory_params = _inspect.signature(
+                        DraftBackendFactory.__init__
+                    ).parameters
+                    _factory_kwargs = {
+                        "draft_model_runner": mr,
+                        "topk": self.topk,
+                        "speculative_num_steps": self.speculative_num_steps,
+                        "seed_dsa_topk_from_draft_extend": False,
+                    }
+                    if "server_args" in _factory_params:
+                        _factory_kwargs["server_args"] = self.server_args
+
+                    logger.info(
+                        "[MTP-SIDECAR-FACTORY] DraftBackendFactory params=%s server_args=%s",
+                        list(_factory_params),
+                        "server_args" in _factory_params,
                     )
+                    _side_factory = DraftBackendFactory(**_factory_kwargs)
                     self._mtp_sidecar_draft_attn_backend = (
                         _side_factory.create_decode_backend()
                     )
