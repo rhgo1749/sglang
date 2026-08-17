@@ -8,6 +8,11 @@ trap 'rm -f "$TMP"' EXIT
 
 cd "$REPO"
 
+# Do not let a failed curl parse response JSON from a previous successful run.
+rm -f /tmp/qwen38-nvfp4-p3-*.json \
+      /tmp/qwen38-nvfp4-p3-*-http.txt \
+      /tmp/qwen38-nvfp4-p3-runtime.log 2>/dev/null || true
+
 # Reuse the proven NVFP4 target+draft smoke, but swap only the sidecar paging
 # hotfix/gates.  Keeping this as a wrapper avoids duplicating a long test script.
 sed \
