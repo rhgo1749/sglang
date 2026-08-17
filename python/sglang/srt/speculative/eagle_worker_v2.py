@@ -2596,7 +2596,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # EAGLE draft keeps the already-proven FlashInfer multi-step path.
                 # The exact image predates --speculative-draft-kv-cache-dtype, so
                 # give only the in-process sidecar a private ServerArgs view with
-                # BF16 KV. Never mutate the published target ServerArgs.
+                # NVFP4 KV with split FlashInfer/TRTLLM-MHA backends. Never mutate the published target ServerArgs.
                 import copy as _mtp_copy
 
                 # CUDA2 is a fully independent draft runtime.  Give it a
@@ -2607,10 +2607,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 object.__setattr__(_side_server_args, "page_size", 1)
                 if getattr(server_args, "kv_cache_dtype", None) == "nvfp4":
                     object.__setattr__(
-                        _side_server_args, "kv_cache_dtype", "bfloat16"
+                        _side_server_args, "kv_cache_dtype", "nvfp4"
+                    )
+                    object.__setattr__(
+                        _side_server_args, "speculative_draft_attention_backend", None
+                    )
+                    object.__setattr__(
+                        _side_server_args, "prefill_attention_backend", "flashinfer"
+                    )
+                    object.__setattr__(
+                        _side_server_args, "decode_attention_backend", "trtllm_mha"
                     )
                     logger.info(
-                        "[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=bfloat16",
+                        "[MTP-CUTOVER-KV] target=nvfp4 CUDA%d draft=nvfp4",
                         sidecar_gpu_id,
                     )
 
