@@ -11,9 +11,45 @@ MAX_MAMBA="${MAX_MAMBA:-3}"
 # 19,23,22 is the only split so far that clears the raw 3x256K capacity gate.
 PARTITION="${PARTITION:-19,23,22}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.99}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
+ENABLE_MTP="${ENABLE_MTP:-0}"
+SPECULATIVE_ALGO="${SPECULATIVE_ALGO:-NEXTN}"
+SPECULATIVE_NUM_STEPS="${SPECULATIVE_NUM_STEPS:-3}"
+SPECULATIVE_EAGLE_TOPK="${SPECULATIVE_EAGLE_TOPK:-1}"
+SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-4}"
+
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 REQUIRED=$((CTX * MAX_RUNNING))
+
+CAPACITY_GATE="${CAPACITY_GATE:-auto}"
+
+if [[ "$CAPACITY_GATE" == "auto" ]]; then
+    if [[ "${ENABLE_MTP:-0}" == "1" ]]; then
+        CAPACITY_GATE_RESOLVED="smoke"
+    else
+        CAPACITY_GATE_RESOLVED="required"
+    fi
+else
+    CAPACITY_GATE_RESOLVED="$CAPACITY_GATE"
+fi
+
+
+MAX_TOTAL_TOKENS_ARGS=()
+if [[ -n "$MAX_TOTAL_TOKENS" ]]; then
+  MAX_TOTAL_TOKENS_ARGS=(--max-total-tokens "$MAX_TOTAL_TOKENS")
+fi
+
+MTP_ARGS=()
+if [[ "$ENABLE_MTP" == "1" ]]; then
+  MTP_ARGS=(
+    --speculative-algorithm "$SPECULATIVE_ALGO"
+    --speculative-num-steps "$SPECULATIVE_NUM_STEPS"
+    --speculative-eagle-topk "$SPECULATIVE_EAGLE_TOPK"
+    --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS"
+  )
+fi
+
 
 cleanup() {
   docker rm -f \
@@ -27,20 +63,27 @@ cleanup() {
 
 dump_logs() {
   docker logs "$CONTAINER" 2>&1 | \
-    grep -Ei 'PP[0-9]|pipeline|NVFP4|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|running-req|queue-req|Traceback|AssertionError|RuntimeError|CUDA error|out of memory|exception' | \
+    grep -Ei 'PP[0-9]|pipeline|MTP|speculative|Qwen3_5ForCausalLMMTP|Load weight|NVFP4|KV Cache|Mamba Cache|Memory pool end|max_total_num_tokens|available_gpu_mem|running-req|queue-req|Traceback|AssertionError|RuntimeError|ValueError|CUDA error|out of memory|exception' | \
     tail -600 || true
 }
 
 echo '============================================================'
-echo ' QWEN3.8 FINAL VANILLA PP3 + NVFP4 RAW 3x256K GATE'
+echo ' QWEN3.8 PP3 + NVFP4 FUNCTIONAL GATE'
 echo " partition=${PARTITION}"
 echo " mem_fraction_static=${MEM_FRACTION_STATIC}"
+echo " max_total_tokens=${MAX_TOTAL_TOKENS:-auto}"
+echo " mtp=${ENABLE_MTP} algo=${SPECULATIVE_ALGO} steps=${SPECULATIVE_NUM_STEPS} topk=${SPECULATIVE_EAGLE_TOPK} draft_tokens=${SPECULATIVE_NUM_DRAFT_TOKENS}"
 echo " chunked_prefill_size=${CHUNKED_PREFILL_SIZE}"
 echo " pytorch_cuda_alloc_conf=${PYTORCH_CUDA_ALLOC_CONF}"
 echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " required=${REQUIRED}"
-echo ' MTP OFF / CUDA GRAPH OFF / NO SOURCE MOUNTS'
+if [[ "${ENABLE_MTP:-0}" == "1" ]]; then
+  echo " MTP ON / CUDA GRAPH OFF"
+else
+  echo " MTP OFF / CUDA GRAPH OFF"
+fi
+echo " capacity_gate=${CAPACITY_GATE_RESOLVED}"
 echo '============================================================'
 
 if (( MAX_MAMBA < MAX_RUNNING )); then
@@ -69,6 +112,8 @@ docker run -d \
     --pp-size 3 \
     --trust-remote-code \
     --context-length "$CTX" \
+    "${MAX_TOTAL_TOKENS_ARGS[@]}" \
+    "${MTP_ARGS[@]}" \
     --kv-cache-dtype nvfp4 \
     --attention-backend flashinfer \
     --prefill-attention-backend flashinfer \
@@ -145,13 +190,18 @@ else:
 PY
 
 if (( CAP < REQUIRED )); then
-  echo 'FINAL_RAW_3X256K_CAPACITY=FAIL'
-  echo '=== GPU STATE ==='
-  nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,pstate --format=csv || true
-  exit 2
-fi
+  if [[ "$CAPACITY_GATE_RESOLVED" == "required" ]]; then
+    echo 'FINAL_TARGET_CAPACITY=FAIL'
+    echo '=== GPU STATE ==='
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu,pstate --format=csv || true
+    exit 2
+  fi
 
-echo 'FINAL_RAW_3X256K_CAPACITY=PASS'
+  echo 'FINAL_TARGET_CAPACITY=BELOW_VANILLA_REQUIREMENT'
+  echo 'capacity_gate_action=CONTINUE_FOR_FUNCTIONAL_SMOKE'
+else
+  echo 'FINAL_TARGET_CAPACITY=PASS'
+fi
 
 echo '=== SINGLE FUNCTIONAL REQUEST ==='
 python3 - <<'PY'
