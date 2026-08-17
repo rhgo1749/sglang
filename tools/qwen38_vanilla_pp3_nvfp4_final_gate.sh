@@ -47,6 +47,10 @@ if [[ "$ENABLE_MTP" == "1" ]]; then
     --speculative-num-steps "$SPECULATIVE_NUM_STEPS"
     --speculative-eagle-topk "$SPECULATIVE_EAGLE_TOPK"
     --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS"
+    # The generic startup warmup sends a real image request for VLMs. Native
+    # MTP+PP3 multimodal embedding transport is a separate gate; keep this
+    # text functional smoke isolated until that bridge is implemented.
+    --skip-server-warmup
   )
 fi
 
@@ -79,7 +83,7 @@ echo " max_running_requests=${MAX_RUNNING}"
 echo " max_mamba_cache_size=${MAX_MAMBA}"
 echo " required=${REQUIRED}"
 if [[ "${ENABLE_MTP:-0}" == "1" ]]; then
-  echo " MTP ON / CUDA GRAPH OFF"
+  echo " MTP ON / CUDA GRAPH OFF / SERVER WARMUP OFF"
 else
   echo " MTP OFF / CUDA GRAPH OFF"
 fi
