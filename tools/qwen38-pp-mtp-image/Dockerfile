@@ -10,6 +10,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_prefill_input.py /tmp/patch_mtp_pp_p
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_mm_fallback.py /tmp/patch_mtp_pp_mm_fallback.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_ownership.py /tmp/patch_mtp_pp_ownership.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_req_source.py /tmp/patch_mtp_pp_req_source.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_mm_identity.py /tmp/patch_mtp_pp_mm_identity.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -17,6 +18,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_mm_fallback.py \
  && python3 /tmp/patch_mtp_pp_ownership.py \
  && python3 /tmp/patch_mtp_pp_req_source.py \
+ && python3 /tmp/patch_mtp_pp_mm_identity.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
@@ -28,4 +30,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_prefill_input.py \
       /tmp/patch_mtp_pp_mm_fallback.py \
       /tmp/patch_mtp_pp_ownership.py \
-      /tmp/patch_mtp_pp_req_source.py
+      /tmp/patch_mtp_pp_req_source.py \
+      /tmp/patch_mtp_pp_mm_identity.py
