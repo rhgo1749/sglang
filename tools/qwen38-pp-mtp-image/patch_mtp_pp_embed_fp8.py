@@ -39,8 +39,13 @@ if METHOD_MARKER not in s:
     forward_block = s[fstart:fend]
     call_count = forward_block.count("self.model.embed_tokens(")
     if call_count != 2:
-        raise RuntimeError(\n            "Expected exactly two MTP embedding lookup call sites in forward; "\n            f"found {call_count}"\n        )
-    forward_block = forward_block.replace(\n        "self.model.embed_tokens(", "self._mtp_embed_tokens(", 2\n    )
+        raise RuntimeError(
+            "Expected exactly two MTP embedding lookup call sites in forward; "
+            f"found {call_count}"
+        )
+    forward_block = forward_block.replace(
+        "self.model.embed_tokens(", "self._mtp_embed_tokens(", 2
+    )
     s = s[:fstart] + forward_block + s[fend:]
     ast.parse(s, filename=str(MTP))
     MTP.write_text(s)
@@ -89,7 +94,10 @@ if forward_block.count("self._mtp_embed_tokens(") != 2:
     raise RuntimeError("MTP forward must route exactly two lookups through FP8 helper")
 
 if eagle_text.count(RUNTIME_MARKER) != 1:
-    raise RuntimeError(\n        "MTP FP8 embedding runtime hook must be injected exactly once; "\n        f"count={eagle_text.count(RUNTIME_MARKER)}"\n    )
+    raise RuntimeError(
+        "MTP FP8 embedding runtime hook must be injected exactly once; "
+        f"count={eagle_text.count(RUNTIME_MARKER)}"
+    )
 if eagle_text.find(RUNTIME_MARKER) > eagle_text.find("[MTP-MEM-AUDIT]"):
     raise RuntimeError("MTP FP8 embedding compression must run before memory audit")
 if eagle_text.find(RUNTIME_MARKER) < eagle_text.find("self.init_lm_head()"):
