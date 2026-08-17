@@ -7,14 +7,14 @@ KEY = "__mtp_pp_input_ids"
 
 # ---------------------------------------------------------------------------
 # 1) Carry the real token ids from PP0 through the PP proxy tensor transport.
-# Later target stages may replace ScheduleBatch.input_ids with PP-local proxy
-# values because they consume hidden states. Native MTP on the last PP stage
-# still needs the original vocabulary ids.
+# ScheduleBatch.prepare_for_extend intentionally leaves input_ids=None and keeps
+# the real extend ids in prefill_input_ids_cpu until forward-stream H2D.  Snapshot
+# that authoritative pinned staging tensor on PP0, not ScheduleBatch.input_ids.
 # ---------------------------------------------------------------------------
 s = SCHED.read_text()
 
 launch_needle = '''                result = self.run_batch(cur_batch, pp_proxy_tensors)\n'''
-launch_replacement = '''                # Native PP-MTP token side-channel. PP0 snapshots the real token\n                # ids before target execution; intermediate stages pop the side\n                # channel out of the model proxy and attach it to ScheduleBatch.\n                if self.pp_group.is_first_rank:\n                    if cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch:\n                        cur_batch._mtp_pp_input_ids = cur_batch.input_ids.detach().clone()\n                elif pp_proxy_tensors is not None:\n                    _mtp_ids = pp_proxy_tensors.tensors.pop("__mtp_pp_input_ids", None)\n                    if _mtp_ids is not None:\n                        cur_batch._mtp_pp_input_ids = _mtp_ids\n\n                result = self.run_batch(cur_batch, pp_proxy_tensors)\n'''
+launch_replacement = '''                # Native PP-MTP token side-channel. For prefill, SGLang keeps\n                # authoritative token ids in prefill_input_ids_cpu and leaves\n                # ScheduleBatch.input_ids=None until forward-stream resolution.\n                if self.pp_group.is_first_rank:\n                    if cur_batch.forward_mode.is_extend() or cur_batch.is_extend_in_batch:\n                        _mtp_ids = getattr(cur_batch, "prefill_input_ids_cpu", None)\n                        if _mtp_ids is None:\n                            _mtp_ids = getattr(cur_batch, "input_ids", None)\n                        if _mtp_ids is None:\n                            raise RuntimeError(\n                                "[MTP-PP-SOURCE-MISSING] PP0 has neither "\n                                "prefill_input_ids_cpu nor input_ids"\n                            )\n                        cur_batch._mtp_pp_input_ids = _mtp_ids.to(\n                            self.device, non_blocking=True\n                        ).detach().clone()\n                        if cur_batch._mtp_pp_input_ids.numel() > 0:\n                            logger.info(\n                                "[MTP-PP-SOURCE-IDS] ids=[%d,%d] tokens=%d",\n                                int(cur_batch._mtp_pp_input_ids.min().item()),\n                                int(cur_batch._mtp_pp_input_ids.max().item()),\n                                int(cur_batch._mtp_pp_input_ids.numel()),\n                            )\n                elif pp_proxy_tensors is not None:\n                    _mtp_ids = pp_proxy_tensors.tensors.pop("__mtp_pp_input_ids", None)\n                    if _mtp_ids is not None:\n                        cur_batch._mtp_pp_input_ids = _mtp_ids\n\n                result = self.run_batch(cur_batch, pp_proxy_tensors)\n'''
 if "Native PP-MTP token side-channel" not in s:
     if launch_needle not in s:
         raise RuntimeError("PP launch insertion point not found")
