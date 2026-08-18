@@ -1,7 +1,7 @@
 FROM lmsysorg/sglang:qwen38-27b
 
 # Production baseline: the validated PP3+MTP path no longer needs synchronous
-# CUDA error attribution.  Keep launch blocking explicitly off for throughput.
+# CUDA error attribution. Keep launch blocking explicitly off for throughput.
 ENV CUDA_LAUNCH_BLOCKING=0
 
 COPY tools/qwen38-pp-mtp-image/patch_pp_spec_guard.py /tmp/patch_pp_spec_guard.py
@@ -23,6 +23,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_embed_fp8.py /tmp/patch_mtp_pp_embed
 COPY tools/qwen38-pp-mtp-image/patch_nvfp4_sequential_dequant.py /tmp/patch_nvfp4_sequential_dequant.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_sparse_mm_bridge.py /tmp/patch_mtp_pp_sparse_mm_bridge.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_graph_scope.py /tmp/patch_mtp_pp_graph_scope.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_target_verify_graph_scope.py /tmp/patch_mtp_pp_target_verify_graph_scope.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_quiet_logs.py /tmp/patch_mtp_pp_quiet_logs.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
@@ -44,6 +45,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_nvfp4_sequential_dequant.py \
  && python3 /tmp/patch_mtp_pp_sparse_mm_bridge.py \
  && python3 /tmp/patch_mtp_pp_graph_scope.py \
+ && python3 /tmp/patch_mtp_pp_target_verify_graph_scope.py \
  && python3 /tmp/patch_mtp_pp_quiet_logs.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
@@ -53,6 +55,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py \
       /sgl-workspace/sglang/python/sglang/srt/layers/logits_processor.py \
       /sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py \
+      /sgl-workspace/sglang/python/sglang/srt/model_executor/model_runner.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_common.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py \
       /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5.py \
@@ -77,4 +80,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_nvfp4_sequential_dequant.py \
       /tmp/patch_mtp_pp_sparse_mm_bridge.py \
       /tmp/patch_mtp_pp_graph_scope.py \
+      /tmp/patch_mtp_pp_target_verify_graph_scope.py \
       /tmp/patch_mtp_pp_quiet_logs.py
