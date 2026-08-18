@@ -2,6 +2,7 @@
 set -euo pipefail
 
 BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
+MODEL="${MODEL:-qwen3.8-27b-NVFP4-Q5K-MTP}"
 SHORT_PROMPT_TOKENS="${SHORT_PROMPT_TOKENS:-4096}"
 SHORT_DECODE_TOKENS="${SHORT_DECODE_TOKENS:-1024}"
 LONG_PROMPT_TOKENS="${LONG_PROMPT_TOKENS:-262000}"
@@ -19,6 +20,7 @@ completion_url="${BASE_URL%/}/completion"
 echo '============================================================'
 echo ' llama.cpp Qwen3.8 serial wall-clock benchmark'
 echo " base_url=${BASE_URL}"
+echo " model=${MODEL}"
 echo " short=${SHORT_PROMPT_TOKENS}+${SHORT_DECODE_TOKENS} x2 serial"
 echo " long=${LONG_PROMPT_TOKENS}+${LONG_DECODE_TOKENS} x2 serial"
 echo ' cache_prompt=false / temperature=0 / ignore_eos=true'
@@ -27,12 +29,10 @@ echo '============================================================'
 
 if ! curl -fsS --max-time 10 "$health_url" >/dev/null; then
   echo "ERROR: llama.cpp health check failed: ${health_url}" >&2
-  echo 'If :8080 is only a router and does not expose llama.cpp native endpoints,' >&2
-  echo 'set BASE_URL to the actual llama-server backend URL.' >&2
   exit 10
 fi
 
-python3 - "$completion_url" "$ROOT" "$SHORT_PROMPT_TOKENS" "$SHORT_DECODE_TOKENS" "$LONG_PROMPT_TOKENS" "$LONG_DECODE_TOKENS" "$REQUEST_TIMEOUT" "$RUN_SHORT" "$RUN_LONG" <<'PY'
+python3 - "$completion_url" "$MODEL" "$ROOT" "$SHORT_PROMPT_TOKENS" "$SHORT_DECODE_TOKENS" "$LONG_PROMPT_TOKENS" "$LONG_DECODE_TOKENS" "$REQUEST_TIMEOUT" "$RUN_SHORT" "$RUN_LONG" <<'PY'
 import json
 import pathlib
 import sys
@@ -42,6 +42,7 @@ import urllib.request
 
 (
     url,
+    model,
     root_s,
     short_prompt_s,
     short_decode_s,
@@ -62,9 +63,9 @@ run_long = run_long_s == "1"
 
 
 def request_once(label: str, req_index: int, prompt_tokens: int, decode_tokens: int):
-    # Match the SGLang synthetic stress pattern: two distinct constant-token prompts.
     token_id = 1200 + req_index
     payload = {
+        "model": model,
         "prompt": [token_id] * prompt_tokens,
         "n_predict": decode_tokens,
         "temperature": 0,
@@ -96,9 +97,6 @@ def request_once(label: str, req_index: int, prompt_tokens: int, decode_tokens: 
     prompt_n = int(timings.get("prompt_n") or data.get("tokens_evaluated") or 0)
     cache_n = int(timings.get("cache_n") or data.get("tokens_cached") or 0)
     predicted_n = int(timings.get("predicted_n") or data.get("tokens_predicted") or 0)
-    # With cache_prompt=false we expect the entire synthetic prompt to be evaluated.
-    # Some builds report prompt_n excluding a compulsory/internal token; native numeric
-    # token arrays should normally be exact, so print rather than silently normalize.
     print(f"{label}_req{req_index}_http={status}")
     print(f"{label}_req{req_index}_wall_seconds={elapsed:.3f}")
     print(f"{label}_req{req_index}_prompt_n={prompt_n}")
@@ -117,11 +115,7 @@ def request_once(label: str, req_index: int, prompt_tokens: int, decode_tokens: 
             else:
                 print(f"{label}_req{req_index}_{dst}={v}")
     print(f"{label}_req{req_index}_truncated={bool(data.get('truncated', False))}")
-    ok = (
-        prompt_n == prompt_tokens
-        and predicted_n == decode_tokens
-        and not bool(data.get("truncated", False))
-    )
+    ok = prompt_n == prompt_tokens and predicted_n == decode_tokens and not bool(data.get("truncated", False))
     print(f"{label}_req{req_index}_exact_token_pass={ok}")
     if not ok:
         raise SystemExit(
