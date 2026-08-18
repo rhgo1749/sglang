@@ -25,6 +25,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_sparse_mm_bridge.py /tmp/patch_mtp_p
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_graph_scope.py /tmp/patch_mtp_pp_graph_scope.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_target_verify_graph_scope.py /tmp/patch_mtp_pp_target_verify_graph_scope.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_mamba_spec_slot_clear.py /tmp/patch_mtp_mamba_spec_slot_clear.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_mamba_track_slot_clear.py /tmp/patch_mtp_mamba_track_slot_clear.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_quiet_logs.py /tmp/patch_mtp_pp_quiet_logs.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
@@ -48,11 +49,13 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_graph_scope.py \
  && python3 /tmp/patch_mtp_pp_target_verify_graph_scope.py \
  && python3 /tmp/patch_mtp_mamba_spec_slot_clear.py \
+ && python3 /tmp/patch_mtp_mamba_track_slot_clear.py \
  && python3 /tmp/patch_mtp_pp_quiet_logs.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
+      /sgl-workspace/sglang/python/sglang/srt/managers/schedule_batch.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/mm_utils.py \
       /sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py \
       /sgl-workspace/sglang/python/sglang/srt/mem_cache/memory_pool.py \
@@ -85,4 +88,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_graph_scope.py \
       /tmp/patch_mtp_pp_target_verify_graph_scope.py \
       /tmp/patch_mtp_mamba_spec_slot_clear.py \
+      /tmp/patch_mtp_mamba_track_slot_clear.py \
       /tmp/patch_mtp_pp_quiet_logs.py
