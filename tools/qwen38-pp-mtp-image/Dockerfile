@@ -22,6 +22,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_local_memory_budget.py /tmp/patch_mt
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_embed_fp8.py /tmp/patch_mtp_pp_embed_fp8.py
 COPY tools/qwen38-pp-mtp-image/patch_nvfp4_sequential_dequant.py /tmp/patch_nvfp4_sequential_dequant.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_sparse_mm_bridge.py /tmp/patch_mtp_pp_sparse_mm_bridge.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_graph_scope.py /tmp/patch_mtp_pp_graph_scope.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_quiet_logs.py /tmp/patch_mtp_pp_quiet_logs.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
@@ -42,6 +43,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_embed_fp8.py \
  && python3 /tmp/patch_nvfp4_sequential_dequant.py \
  && python3 /tmp/patch_mtp_pp_sparse_mm_bridge.py \
+ && python3 /tmp/patch_mtp_pp_graph_scope.py \
  && python3 /tmp/patch_mtp_pp_quiet_logs.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
@@ -74,4 +76,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_embed_fp8.py \
       /tmp/patch_nvfp4_sequential_dequant.py \
       /tmp/patch_mtp_pp_sparse_mm_bridge.py \
+      /tmp/patch_mtp_pp_graph_scope.py \
       /tmp/patch_mtp_pp_quiet_logs.py
