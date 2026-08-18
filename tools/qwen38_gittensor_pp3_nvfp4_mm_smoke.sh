@@ -55,7 +55,10 @@ req = {
         }
     ],
     "temperature": 0,
-    "max_tokens": 32,
+    # Qwen reasoning can consume the first few dozen completion tokens before
+    # publishing final content. 32 tokens was too small for a semantic smoke and
+    # could end with finish_reason=length while the vision path itself was fine.
+    "max_tokens": 128,
 }
 with open(out, "w") as f:
     json.dump(req, f, separators=(",", ":"))
@@ -76,19 +79,25 @@ echo "mm_smoke_http=${HTTP}"
 
 set +e
 python3 - "$ROOT/response.json" "$HTTP" "$RC" <<'PY'
-import json, pathlib, re, sys
+import json, re, sys
 path, http, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
 ok = rc == 0 and http == "200"
-text = ""
+content = reasoning = finish = ""
 try:
     d = json.load(open(path))
     choice = (d.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
-    text = str(msg.get("content") or "").strip()
-    if not text:
-        text = str(msg.get("reasoning_content") or "").strip()
-    print(f"mm_smoke_content={text!r}")
-    semantic = bool(re.search(r"\\bred\\b", text, re.I))
+    content = str(msg.get("content") or "").strip()
+    reasoning = str(msg.get("reasoning_content") or "").strip()
+    finish = str(choice.get("finish_reason") or "")
+    combined = " ".join(x for x in (reasoning, content) if x)
+    print(f"mm_smoke_content={content!r}")
+    print(f"mm_smoke_reasoning={reasoning!r}")
+    print(f"mm_smoke_finish_reason={finish!r}")
+    # Previous smoke accidentally used r"\\bred\\b", which searches for
+    # literal backslashes instead of regex word boundaries and can never match
+    # an ordinary answer like "red".
+    semantic = bool(re.search(r"\bred\b", combined, re.I))
     print(f"mm_smoke_semantic_red={semantic}")
     ok = ok and semantic
 except Exception as e:
