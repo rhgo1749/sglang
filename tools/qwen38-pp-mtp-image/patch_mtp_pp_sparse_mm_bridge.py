@@ -12,7 +12,7 @@ MARKER = "[MTP-PP-SPARSE-MM-BRIDGE]"
 
 # ---------------------------------------------------------------------------
 # 1) PP0 token side-channel: multimodal hash/pad ids are intentionally outside
-#    the vocabulary.  They are valid only when the request really carries MM
+#    the vocabulary. They are valid only when the request really carries MM
 #    inputs; text-only OOB remains a hard error.
 # ---------------------------------------------------------------------------
 s = SCHED.read_text()
@@ -33,7 +33,7 @@ if "[MTP-PP-MM-HASH-IDS]" not in s:
 # ---------------------------------------------------------------------------
 # 2) On PP0, preserve only the rows that are replaced by multimodal features.
 #    embed_mm_inputs() intentionally clamps hash ids in-place, so snapshot their
-#    flattened chunk positions before that call.  The current chunk is <= the
+#    flattened chunk positions before that call. The current chunk is <= the
 #    configured chunked-prefill size; we never transport a full-context
 #    [tokens, hidden] embedding tensor across PP.
 # ---------------------------------------------------------------------------
@@ -59,7 +59,7 @@ if MARKER not in s:
     MM.write_text(s)
 
 # ---------------------------------------------------------------------------
-# 3) Qwen3.5 target shards propagate the sparse rows through PP.  On PP-last,
+# 3) Qwen3.5 target shards propagate the sparse rows through PP. On PP-last,
 #    publish them on ForwardBatch so the logits metadata can carry them to the
 #    EAGLE worker that owns native MTP.
 # ---------------------------------------------------------------------------
@@ -114,15 +114,21 @@ if "mtp_pp_mm_positions" not in s:
 # ---------------------------------------------------------------------------
 # 5) PP-last: reconstruct only this prefill chunk's full MTP embedding tensor
 #    from the draft's compact FP8 text table plus transported sparse MM rows.
-#    With chunked prefill=1024 this is ~10 MiB BF16, independent of 256K context.
+#    IMPORTANT: replace the *whole* parenthesized next_draft_input assignment.
+#    Replacing only the inner call leaves executable statements inside
+#    `batch_output.next_draft_input = (` and creates invalid Python.
 # ---------------------------------------------------------------------------
 s = EAGLE.read_text()
 if "[MTP-PP-SPARSE-MM-REBUILD]" not in s:
-    call = '''                    self.draft_worker._draft_extend_for_prefill(\n                        batch,\n                        batch_output.logits_output.hidden_states,\n                        batch_output.next_token_ids,\n                        batch_output.logits_output.mm_input_embeds,\n                    )\n'''
-    repl = '''                    _mtp_mm_full = batch_output.logits_output.mm_input_embeds\n                    _mtp_mm_pos = getattr(\n                        batch_output.logits_output, "mtp_pp_mm_positions", None\n                    )\n                    _mtp_mm_rows = getattr(\n                        batch_output.logits_output, "mtp_pp_mm_embeds", None\n                    )\n                    if (\n                        _mtp_mm_full is None\n                        and _mtp_mm_pos is not None\n                        and _mtp_mm_rows is not None\n                        and int(_mtp_mm_pos.numel()) > 0\n                    ):\n                        _mtp_model = self.draft_worker.draft_runner.model\n                        if not hasattr(_mtp_model, "_mtp_embed_tokens"):\n                            raise RuntimeError(\n                                "[MTP-PP-SPARSE-MM-REBUILD] draft model lacks "\n                                "_mtp_embed_tokens"\n                            )\n                        _mtp_embed_rows = int(\n                            _mtp_model.model.embed_tokens.weight.shape[0]\n                        )\n                        _mtp_safe_ids = batch.input_ids.clamp(\n                            min=0, max=_mtp_embed_rows - 1\n                        )\n                        _mtp_mm_full = _mtp_model._mtp_embed_tokens(_mtp_safe_ids)\n                        _mtp_pos_dev = _mtp_mm_pos.to(\n                            _mtp_mm_full.device, dtype=torch.int64, non_blocking=True\n                        )\n                        _mtp_rows_dev = _mtp_mm_rows.to(\n                            _mtp_mm_full.device,\n                            dtype=_mtp_mm_full.dtype,\n                            non_blocking=True,\n                        )\n                        if int(_mtp_pos_dev.numel()) != int(_mtp_rows_dev.shape[0]):\n                            raise RuntimeError(\n                                "[MTP-PP-SPARSE-MM-LEN] "\n                                f"positions={int(_mtp_pos_dev.numel())} "\n                                f"rows={int(_mtp_rows_dev.shape[0])}"\n                            )\n                        _mtp_mm_full.index_copy_(0, _mtp_pos_dev, _mtp_rows_dev)\n                        logger.info(\n                            "[MTP-PP-SPARSE-MM-REBUILD] PP%d chunk_tokens=%d "\n                            "mm_rows=%d hidden=%d bytes=%.2fMiB",\n                            int(self.ps.pp_rank),\n                            int(_mtp_mm_full.shape[0]),\n                            int(_mtp_pos_dev.numel()),\n                            int(_mtp_mm_full.shape[1]),\n                            _mtp_mm_full.numel() * _mtp_mm_full.element_size() / (1 << 20),\n                        )\n\n                    self.draft_worker._draft_extend_for_prefill(\n                        batch,\n                        batch_output.logits_output.hidden_states,\n                        batch_output.next_token_ids,\n                        _mtp_mm_full,\n                    )\n'''
-    if call not in s:
-        raise RuntimeError("EAGLE PP-last draft prefill MM call anchor not found")
-    s = s.replace(call, repl, 1)
+    assignment = '''                batch_output.next_draft_input = (\n                    self.draft_worker._draft_extend_for_prefill(\n                        batch,\n                        batch_output.logits_output.hidden_states,\n                        batch_output.next_token_ids,\n                        batch_output.logits_output.mm_input_embeds,\n                    )\n                )\n'''
+    repl = '''                _mtp_mm_full = batch_output.logits_output.mm_input_embeds\n                _mtp_mm_pos = getattr(\n                    batch_output.logits_output, "mtp_pp_mm_positions", None\n                )\n                _mtp_mm_rows = getattr(\n                    batch_output.logits_output, "mtp_pp_mm_embeds", None\n                )\n                if (\n                    _mtp_mm_full is None\n                    and _mtp_mm_pos is not None\n                    and _mtp_mm_rows is not None\n                    and int(_mtp_mm_pos.numel()) > 0\n                ):\n                    _mtp_model = self.draft_worker.draft_runner.model\n                    if not hasattr(_mtp_model, "_mtp_embed_tokens"):\n                        raise RuntimeError(\n                            "[MTP-PP-SPARSE-MM-REBUILD] draft model lacks "\n                            "_mtp_embed_tokens"\n                        )\n                    _mtp_embed_rows = int(\n                        _mtp_model.model.embed_tokens.weight.shape[0]\n                    )\n                    _mtp_safe_ids = batch.input_ids.clamp(\n                        min=0, max=_mtp_embed_rows - 1\n                    )\n                    _mtp_mm_full = _mtp_model._mtp_embed_tokens(_mtp_safe_ids)\n                    _mtp_pos_dev = _mtp_mm_pos.to(\n                        _mtp_mm_full.device, dtype=torch.int64, non_blocking=True\n                    )\n                    _mtp_rows_dev = _mtp_mm_rows.to(\n                        _mtp_mm_full.device,\n                        dtype=_mtp_mm_full.dtype,\n                        non_blocking=True,\n                    )\n                    if int(_mtp_pos_dev.numel()) != int(_mtp_rows_dev.shape[0]):\n                        raise RuntimeError(\n                            "[MTP-PP-SPARSE-MM-LEN] "\n                            f"positions={int(_mtp_pos_dev.numel())} "\n                            f"rows={int(_mtp_rows_dev.shape[0])}"\n                        )\n                    _mtp_mm_full.index_copy_(0, _mtp_pos_dev, _mtp_rows_dev)\n                    logger.info(\n                        "[MTP-PP-SPARSE-MM-REBUILD] PP%d chunk_tokens=%d "\n                        "mm_rows=%d hidden=%d bytes=%.2fMiB",\n                        int(self.ps.pp_rank),\n                        int(_mtp_mm_full.shape[0]),\n                        int(_mtp_pos_dev.numel()),\n                        int(_mtp_mm_full.shape[1]),\n                        _mtp_mm_full.numel() * _mtp_mm_full.element_size() / (1 << 20),\n                    )\n\n                batch_output.next_draft_input = (\n                    self.draft_worker._draft_extend_for_prefill(\n                        batch,\n                        batch_output.logits_output.hidden_states,\n                        batch_output.next_token_ids,\n                        _mtp_mm_full,\n                    )\n                )\n'''
+    count = s.count(assignment)
+    if count != 1:
+        raise RuntimeError(\n            "EAGLE PP-last draft prefill assignment anchor count "\n            f"must be 1, got {count}"\n        )
+    s = s.replace(assignment, repl, 1)
+    # Parse before writing so installer mistakes fail without publishing a
+    # syntactically corrupt target file into the current image layer.
+    ast.parse(s, filename=str(EAGLE))
     EAGLE.write_text(s)
 
 # ---------------------------------------------------------------------------
