@@ -14,8 +14,7 @@ MAX_RUNNING="${MAX_RUNNING:-2}"
 MAX_MAMBA="${MAX_MAMBA:-2}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-
-CG_JSON='{"decode":{"backend":"full","max_bs":2,"bs":[1,2]},"prefill":{"backend":"disabled"}}'
+SEMANTIC_BOOT_CHECK="${SEMANTIC_BOOT_CHECK:-1}"
 
 if [[ "$PARTITION" != "23,28,13" ]]; then
   echo "WARNING: validated partition is 23,28,13; requested ${PARTITION}" >&2
@@ -31,7 +30,7 @@ fi
 
 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
-echo "Starting validated Qwen3.8 PP3/native-MTP 2x256K preset"
+echo "Starting correctness-validated Qwen3.8 PP3/native-MTP 2x256K preset"
 echo "  image=${IMAGE}"
 echo "  model=${MODEL}"
 echo "  port=${PORT}"
@@ -39,8 +38,8 @@ echo "  partition=${PARTITION}"
 echo "  context=${CTX}"
 echo "  pool=${MAX_TOTAL_TOKENS}"
 echo "  chunked_prefill=${CHUNKED_PREFILL_SIZE}"
-echo "  decode_cuda_graph_bs=1,2"
-echo "  prefill_cuda_graph=disabled"
+echo "  cuda_graph=disabled (native-MTP semantic correctness baseline)"
+echo "  semantic_boot_check=${SEMANTIC_BOOT_CHECK}"
 
 docker run -d \
   --name "$CONTAINER" \
@@ -79,7 +78,7 @@ docker run -d \
     --disable-radix-cache \
     --mm-feature-transport cpu \
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
-    --cuda-graph-config "$CG_JSON" \
+    --disable-cuda-graph \
     --disable-flashinfer-autotune \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
@@ -100,5 +99,53 @@ done
 fi
 
 echo "BOOT_PASS=True"
+
+if [[ "$SEMANTIC_BOOT_CHECK" == "1" ]]; then
+  REQ="$(mktemp)"
+  RESP="$(mktemp)"
+  trap 'rm -f "$REQ" "$RESP"' EXIT
+  python3 - "$REQ" "$MODEL" <<'PY'
+import json, sys
+json.dump({
+    "model": sys.argv[2],
+    "messages": [{"role": "user", "content": "Reply with exactly: TEXT_CONTROL_OK"}],
+    "temperature": 0,
+    "max_tokens": 256,
+}, open(sys.argv[1], "w"), separators=(",", ":"))
+PY
+  set +e
+  HTTP="$(curl --max-time 180 -sS -o "$RESP" -w '%{http_code}' \
+    "http://127.0.0.1:${PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' --data-binary "@$REQ")"
+  RC=$?
+  set -e
+  if ! python3 - "$RESP" "$HTTP" "$RC" <<'PY'
+import json, sys
+path, http, rc = sys.argv[1], sys.argv[2], int(sys.argv[3])
+ok = rc == 0 and http == "200"
+try:
+    d = json.load(open(path))
+    c = (d.get("choices") or [{}])[0]
+    m = c.get("message") or {}
+    combined = " ".join(
+        x for x in (
+            str(m.get("reasoning_content") or ""),
+            str(m.get("content") or ""),
+        ) if x
+    )
+    ok = ok and "TEXT_CONTROL_OK" in combined
+except Exception:
+    ok = False
+print(f"SEMANTIC_BOOT_PASS={ok}")
+raise SystemExit(0 if ok else 1)
+PY
+  then
+    echo "ERROR: server booted but native-MTP semantic control failed" >&2
+    docker logs "$CONTAINER" 2>&1 | tail -240 || true
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    exit 3
+  fi
+fi
+
 echo "QWEN38_GITTENSOR_PP3_NVFP4_X2_256K_SERVE=READY"
 echo "endpoint=http://127.0.0.1:${PORT}"
