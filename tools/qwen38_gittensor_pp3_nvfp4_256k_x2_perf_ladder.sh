@@ -32,21 +32,31 @@ export FAILFAST_STALL_SECONDS="${FAILFAST_STALL_SECONDS:-45}"
 export FAILFAST_STALL_GPU_UTIL_MAX="${FAILFAST_STALL_GPU_UTIL_MAX:-5}"
 
 CHUNK_STAGE="${CHUNK_STAGE:-1024}"
+START_STAGE="${START_STAGE:-A}"
 CG_JSON='{"decode":{"backend":"full","max_bs":2,"bs":[1,2]},"prefill":{"backend":"disabled"}}'
+
+case "$START_STAGE" in
+  A|B) ;;
+  *) echo "ERROR: START_STAGE must be A or B, got ${START_STAGE}"; exit 64 ;;
+esac
 
 cleanup() {
   [[ -n "${TMP_GATE:-}" ]] && rm -f "$TMP_GATE" || true
 }
 trap cleanup EXIT
 
-echo '============================================================'
-echo ' PERF LADDER A: chunked prefill 1024 / CUDA Graph OFF'
-echo '============================================================'
 export CHUNKED_PREFILL_SIZE="$CHUNK_STAGE"
-bash "$ROOT_DIR/qwen38_gittensor_pp3_nvfp4_256k_x2_probe.sh"
-echo 'QWEN38_X2_256K_PERF_STAGE_A_CHUNK1024=PASS'
+if [[ "$START_STAGE" == "A" ]]; then
+  echo '============================================================'
+  echo ' PERF LADDER A: chunked prefill 1024 / CUDA Graph OFF'
+  echo '============================================================'
+  bash "$ROOT_DIR/qwen38_gittensor_pp3_nvfp4_256k_x2_probe.sh"
+  echo 'QWEN38_X2_256K_PERF_STAGE_A_CHUNK1024=PASS'
+else
+  echo 'QWEN38_X2_256K_PERF_STAGE_A_CHUNK1024=SKIPPED_ALREADY_VALIDATED'
+fi
 
-# The validated gate intentionally hard-codes --disable-cuda-graph.  Generate a
+# The validated gate intentionally hard-codes --disable-cuda-graph. Generate a
 # temporary host-only variant for the experimental decode-only graph stage so
 # the golden gate remains unchanged and can always be rerun verbatim.
 TMP_GATE="$(mktemp /tmp/qwen38-x2-decode-cg.XXXXXX.sh)"
