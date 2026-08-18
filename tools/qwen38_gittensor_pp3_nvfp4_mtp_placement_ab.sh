@@ -57,7 +57,7 @@ s=s.replace('    --speculative-algorithm "$SPECULATIVE_ALGO" \\\n','',1)
 s=s.replace('    --speculative-num-steps "$SPECULATIVE_NUM_STEPS" \\\n','',1)
 s=s.replace('    --speculative-eagle-topk "$SPECULATIVE_EAGLE_TOPK" \\\n','',1)
 s=s.replace('    --speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS" \\\n','',1)
-# The base gate constructs MTP_ARGS dynamically.  Disabling ENABLE_MTP is the
+# The base gate constructs MTP_ARGS dynamically. Disabling ENABLE_MTP is the
 # authoritative switch; keep the textual removals above harmless across older
 # exact-image gate revisions.
 s='ENABLE_MTP="${ENABLE_MTP:-0}"'.join(s.split('ENABLE_MTP="${ENABLE_MTP:-1}"',1)) if 'ENABLE_MTP="${ENABLE_MTP:-1}"' in s else s
@@ -96,7 +96,6 @@ run_gate() {
   STAGE="$PERF_STAGE" DECODE_TOKENS="$PERF_DECODE_TOKENS" \
   PARTITION="$PARTITION" ROOT="$ROOT/${label}-artifacts" \
     bash "$ROOT_DIR/qwen38_failfast_watch.sh" bash "$gate" | tee "$log"
-  extract_elapsed "$log"
 }
 
 echo '============================================================'
@@ -130,7 +129,8 @@ if [[ "$RUN_ONLY_C" != "1" ]]; then
 fi
 
 make_5070_last_gate
-C_S="$(run_gate c_mtp_5070_last "$TMP_C" "$C_LOG" | tail -n1)"
+run_gate c_mtp_5070_last "$TMP_C" "$C_LOG"
+C_S="$(extract_elapsed "$C_LOG")"
 
 if [[ "$RUN_ONLY_C" == "1" ]]; then
   python3 - "$C_S" <<'PY'
