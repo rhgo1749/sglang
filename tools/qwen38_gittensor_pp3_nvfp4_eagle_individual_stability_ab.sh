@@ -11,6 +11,8 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 STAGE="${STAGE:-262000}"
 DECODE_TOKENS="${DECODE_TOKENS:-8}"
 REPEATS="${REPEATS:-2}"
+SKIP_DRAFT_DECODE="${SKIP_DRAFT_DECODE:-0}"
+KNOWN_DRAFT_DECODE_UNSAFE="${KNOWN_DRAFT_DECODE_UNSAFE:-0}"
 ROOT="${ROOT:-/tmp/qwen38-eagle-individual-stability}"
 TMP_GATES=()
 SUCCESS=0
@@ -164,23 +166,38 @@ echo ' EAGLE INDIVIDUAL GRAPH STABILITY A/B: native MTP / PP3 / 2x256K'
 echo ' Known facts: prefill BCG unsafe; combined EAGLE path passed once and failed once'
 echo ' TARGET_VERIFY eager; prefill graph disabled for every case'
 echo " repeats_per_component=${REPEATS}"
+echo " skip_draft_decode=${SKIP_DRAFT_DECODE} known_draft_decode_unsafe=${KNOWN_DRAFT_DECODE_UNSAFE}"
 echo '============================================================'
 
 if (( REPEATS < 1 )); then
   echo 'ERROR: REPEATS must be >= 1' >&2
   exit 64
 fi
+if [[ "$SKIP_DRAFT_DECODE" == "1" && "$KNOWN_DRAFT_DECODE_UNSAFE" != "1" ]]; then
+  echo 'ERROR: SKIP_DRAFT_DECODE=1 requires KNOWN_DRAFT_DECODE_UNSAFE=1' >&2
+  exit 65
+fi
 
 for round in $(seq 1 "$REPEATS"); do
-  # draft-decode graph ON, draft-extend graph OFF
-  if ! run_once draft_decode_only "$round" 0 1; then
-    classify_and_finish "DRAFT_DECODE_CUDA_GRAPH_POST_LONG_UNSAFE_ROUND_${round}"
+  if [[ "$SKIP_DRAFT_DECODE" != "1" ]]; then
+    # draft-decode graph ON, draft-extend graph OFF
+    if ! run_once draft_decode_only "$round" 0 1; then
+      classify_and_finish "DRAFT_DECODE_CUDA_GRAPH_POST_LONG_UNSAFE_ROUND_${round}"
+    fi
+  else
+    echo "=== draft_decode_only_r${round}: SKIPPED (known unsafe) ==="
   fi
 
   # draft-decode graph OFF, draft-extend graph ON
   if ! run_once draft_extend_only "$round" 1 0; then
+    if [[ "$KNOWN_DRAFT_DECODE_UNSAFE" == "1" ]]; then
+      classify_and_finish "BOTH_EAGLE_GRAPHS_INDIVIDUALLY_POST_LONG_UNSAFE_DRAFT_EXTEND_ROUND_${round}"
+    fi
     classify_and_finish "DRAFT_EXTEND_CUDA_GRAPH_POST_LONG_UNSAFE_ROUND_${round}"
   fi
 done
 
+if [[ "$KNOWN_DRAFT_DECODE_UNSAFE" == "1" ]]; then
+  classify_and_finish 'DRAFT_DECODE_UNSAFE_DRAFT_EXTEND_STABLE'
+fi
 classify_and_finish 'INDIVIDUAL_EAGLE_GRAPHS_STABLE_COMBINED_EAGLE_PATH_INTERMITTENT_UNSAFE'
