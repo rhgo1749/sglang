@@ -38,10 +38,7 @@ echo "  partition=${PARTITION}"
 echo "  context=${CTX}"
 echo "  pool=${MAX_TOTAL_TOKENS}"
 echo "  chunked_prefill=${CHUNKED_PREFILL_SIZE}"
-echo "  target_verify_graph=disabled (capture/replay eager)"
-echo "  prefill_graph=disabled (post-long semantic stop condition)"
-echo "  eagle_draft_decode_graph=enabled"
-echo "  eagle_draft_extend_graph=enabled"
+echo "  cuda_graph=disabled (native-MTP semantic correctness baseline)"
 echo "  semantic_boot_check=${SEMANTIC_BOOT_CHECK}"
 
 docker run -d \
@@ -53,9 +50,6 @@ docker run -d \
   --ulimit stack=67108864 \
   -e "SGLANG_PP_LAYER_PARTITION=${PARTITION}" \
   -e "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}" \
-  -e "SGLANG_MTP_DISABLE_TARGET_VERIFY_CUDA_GRAPH=1" \
-  -e "SGLANG_MTP_DISABLE_DRAFT_DECODE_CUDA_GRAPH=0" \
-  -e "SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH=0" \
   -p "${PORT}:30000" \
   -v sglang-hf-cache:/root/.cache/huggingface \
   "$IMAGE" \
@@ -84,7 +78,7 @@ docker run -d \
     --disable-radix-cache \
     --mm-feature-transport cpu \
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
-    --cuda-graph-config '{"decode":{"backend":"full","max_bs":2,"bs":[1,2]},"prefill":{"backend":"disabled"}}' \
+    --disable-cuda-graph \
     --disable-flashinfer-autotune \
     --reasoning-parser qwen3 \
     --tool-call-parser qwen3_coder \
