@@ -11,6 +11,8 @@ CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-1024}"
 STAGE="${STAGE:-262000}"
 DECODE_TOKENS="${DECODE_TOKENS:-8}"
 ROOT="${ROOT:-/tmp/qwen38-post-long-graph-components}"
+SKIP_PREFILL_ONLY="${SKIP_PREFILL_ONLY:-0}"
+KNOWN_PREFILL_BCG_FAIL="${KNOWN_PREFILL_BCG_FAIL:-0}"
 TMP_GATES=()
 SUCCESS=0
 mkdir -p "$ROOT"
@@ -164,22 +166,34 @@ echo ' POST-LONG GRAPH COMPONENT A/B: native MTP / PP3 / 2x256K'
 echo ' Known baseline: all hybrid graphs ON corrupts; all graphs OFF passes'
 echo '============================================================'
 
-# 1) Clean prefill-graph-only test. decode backend disabled means the EAGLE
-# specialized decode/draft-extend capture routine returns before either graph,
-# while breakable prefill graphs remain enabled. TARGET_VERIFY is eager.
-PREFILL_ONLY="$(run_variant prefill_only disabled breakable 1 1 | tee /dev/stderr | tail -n1)"
-if [[ "$PREFILL_ONLY" != 1 ]]; then
-  classify_and_finish 'PREFILL_BCG_POST_LONG_STATE_CORRUPTION'
+PREFILL_FAILED="$KNOWN_PREFILL_BCG_FAIL"
+if [[ "$SKIP_PREFILL_ONLY" == "1" ]]; then
+  echo "=== prefill_only: SKIPPED (known result supplied: fail=${PREFILL_FAILED}) ==="
+else
+  # Clean prefill-graph-only test. decode backend disabled means the EAGLE
+  # specialized decode/draft-extend capture routine returns before either graph,
+  # while breakable prefill graphs remain enabled. TARGET_VERIFY is eager.
+  PREFILL_ONLY="$(run_variant prefill_only disabled breakable 1 1 | tee /dev/stderr | tail -n1)"
+  if [[ "$PREFILL_ONLY" != 1 ]]; then
+    PREFILL_FAILED=1
+    echo 'prefill_only_isolated_failure=True'
+  else
+    PREFILL_FAILED=0
+  fi
 fi
 
-# 2) EAGLE graph family with prefill graphs disabled. TARGET_VERIFY remains eager.
+# EAGLE graph family with prefill graphs disabled. TARGET_VERIFY remains eager.
 EAGLE_BOTH="$(run_variant eagle_both full disabled 0 0 | tee /dev/stderr | tail -n1)"
 if [[ "$EAGLE_BOTH" == 1 ]]; then
-  # Each family is clean in isolation, but the already-proven all-on hybrid is not.
+  if [[ "$PREFILL_FAILED" == "1" ]]; then
+    classify_and_finish 'PREFILL_BCG_ONLY_POST_LONG_STATE_CORRUPTION_EAGLE_GRAPHS_SAFE'
+  fi
+  # Both graph families pass in isolation, but the already-proven all-on hybrid
+  # fails: only their interaction remains.
   classify_and_finish 'PREFILL_X_EAGLE_GRAPH_INTERACTION'
 fi
 
-# 3) Split the EAGLE family. Keep prefill disabled so each specialized graph is
+# Split the EAGLE family. Keep prefill disabled so each specialized graph is
 # tested without the BCG family in the process.
 DRAFT_DECODE="$(run_variant draft_decode_only full disabled 0 1 | tee /dev/stderr | tail -n1)"
 if [[ "$DRAFT_DECODE" != 1 ]]; then
@@ -191,5 +205,5 @@ if [[ "$DRAFT_EXTEND" != 1 ]]; then
   classify_and_finish 'DRAFT_EXTEND_CUDA_GRAPH_POST_LONG_STATE_CORRUPTION'
 fi
 
-# Both individual specialized graphs pass, but together failed in step 2.
+# Both individual specialized graphs pass, but together failed above.
 classify_and_finish 'DRAFT_DECODE_X_DRAFT_EXTEND_GRAPH_INTERACTION'
