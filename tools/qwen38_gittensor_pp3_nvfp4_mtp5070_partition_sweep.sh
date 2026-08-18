@@ -7,23 +7,29 @@ MODEL="${MODEL:-gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090}"
 PORT="${PORT:-30001}"
 PERF_STAGE="${PERF_STAGE:-4096}"
 PERF_DECODE_TOKENS="${PERF_DECODE_TOKENS:-1024}"
-ROOT="${ROOT:-/tmp/qwen38-mtp5070-partition-sweep}"
+ROOT="${ROOT:-/tmp/qwen38-mtp5070-partition-sweep-v2}"
 
 # Mapping for every candidate:
 #   physical GPU0 RTX 5070 Ti -> PP0
 #   physical GPU1 RTX 5060 Ti -> PP1
 #   physical GPU2 RTX 5070 Ti -> PP2 + colocated native MTP
 #
-# Baseline C=23,28,13 already measured 107.629s. The purpose of this sweep is
-# to reduce work on the slower 5060 Ti middle stage while keeping MTP on a 5070 Ti.
-# Keep the candidate set bounded; if none beats the validated A baseline
-# (23,28,13 with PP-last/MTP on 5060 Ti, 98.922s), stop this placement family.
+# Observed capacity boundary:
+#   26,22,16 => PP0 profiles only 429376 target tokens, below required 524288.
+# Therefore keep PP0 at the validated 23-layer level and shift target work from
+# the slower middle 5060 Ti stage toward the final 5070 Ti + MTP stage.
+#
+# Baselines:
+#   A: 23,28,13 with PP-last/MTP on 5060 Ti = 98.922 s
+#   C: 23,28,13 with PP-last/MTP on 5070 Ti = 107.629 s
+#
+# Stop condition: if none of these bounded candidates beats A, close the
+# MTP@5070 placement family rather than continuing a broad partition search.
 
 PARTITIONS=(
-  "26,22,16"
-  "28,20,16"
-  "29,18,17"
-  "28,14,22"
+  "23,22,19"
+  "23,21,20"
+  "23,20,21"
 )
 
 mkdir -p "$ROOT"
@@ -38,11 +44,13 @@ restore_baseline() {
 trap restore_baseline EXIT
 
 echo '============================================================'
-echo ' MTP@5070 PARTITION SWEEP'
+echo ' MTP@5070 PARTITION SWEEP V2'
 echo ' mapping: 5070(PP0) / 5060(PP1) / 5070(PP2+MTP)'
+echo ' strategy: hold PP0=23, reduce PP1, grow PP2'
 echo " prompt=${PERF_STAGE} decode=${PERF_DECODE_TOKENS}"
 echo ' reference_A_5060_last_seconds=98.922'
 echo ' reference_C_23_28_13_seconds=107.629'
+echo ' known_capacity_fail_26_22_16_pp0_tokens=429376'
 echo '============================================================'
 
 for p in "${PARTITIONS[@]}"; do
