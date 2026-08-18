@@ -21,6 +21,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_pool_profile.py /tmp/patch_mtp_pp_po
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_local_memory_budget.py /tmp/patch_mtp_pp_local_memory_budget.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_embed_fp8.py /tmp/patch_mtp_pp_embed_fp8.py
 COPY tools/qwen38-pp-mtp-image/patch_nvfp4_sequential_dequant.py /tmp/patch_nvfp4_sequential_dequant.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_sparse_mm_bridge.py /tmp/patch_mtp_pp_sparse_mm_bridge.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_quiet_logs.py /tmp/patch_mtp_pp_quiet_logs.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
@@ -40,15 +41,19 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_local_memory_budget.py \
  && python3 /tmp/patch_mtp_pp_embed_fp8.py \
  && python3 /tmp/patch_nvfp4_sequential_dequant.py \
+ && python3 /tmp/patch_mtp_pp_sparse_mm_bridge.py \
  && python3 /tmp/patch_mtp_pp_quiet_logs.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler_pp_mixin.py \
+      /sgl-workspace/sglang/python/sglang/srt/managers/mm_utils.py \
       /sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py \
+      /sgl-workspace/sglang/python/sglang/srt/layers/logits_processor.py \
       /sgl-workspace/sglang/python/sglang/srt/layers/quantization/fp4_kv_cache_quant_method.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_common.py \
       /sgl-workspace/sglang/python/sglang/srt/speculative/eagle_worker_v2.py \
+      /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5.py \
       /sgl-workspace/sglang/python/sglang/srt/models/qwen3_5_mtp.py \
  && rm \
       /tmp/patch_pp_spec_guard.py \
@@ -68,4 +73,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_local_memory_budget.py \
       /tmp/patch_mtp_pp_embed_fp8.py \
       /tmp/patch_nvfp4_sequential_dequant.py \
+      /tmp/patch_mtp_pp_sparse_mm_bridge.py \
       /tmp/patch_mtp_pp_quiet_logs.py
