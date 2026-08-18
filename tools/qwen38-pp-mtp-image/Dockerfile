@@ -1,8 +1,8 @@
 FROM lmsysorg/sglang:qwen38-27b
 
-# Diagnostic image: make the first failing CUDA op report at the real Python
-# call site instead of surfacing later at an unrelated synchronization point.
-ENV CUDA_LAUNCH_BLOCKING=1
+# Production baseline: the validated PP3+MTP path no longer needs synchronous
+# CUDA error attribution.  Keep launch blocking explicitly off for throughput.
+ENV CUDA_LAUNCH_BLOCKING=0
 
 COPY tools/qwen38-pp-mtp-image/patch_pp_spec_guard.py /tmp/patch_pp_spec_guard.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_early_share.py /tmp/patch_mtp_early_share.py
@@ -20,6 +20,7 @@ COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_pool_profile.py /tmp/patch_mtp_pp_po
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_local_memory_budget.py /tmp/patch_mtp_pp_local_memory_budget.py
 COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_embed_fp8.py /tmp/patch_mtp_pp_embed_fp8.py
 COPY tools/qwen38-pp-mtp-image/patch_nvfp4_sequential_dequant.py /tmp/patch_nvfp4_sequential_dequant.py
+COPY tools/qwen38-pp-mtp-image/patch_mtp_pp_quiet_logs.py /tmp/patch_mtp_pp_quiet_logs.py
 
 RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_early_share.py \
@@ -37,6 +38,7 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
  && python3 /tmp/patch_mtp_pp_local_memory_budget.py \
  && python3 /tmp/patch_mtp_pp_embed_fp8.py \
  && python3 /tmp/patch_nvfp4_sequential_dequant.py \
+ && python3 /tmp/patch_mtp_pp_quiet_logs.py \
  && python3 -m py_compile \
       /sgl-workspace/sglang/python/sglang/srt/server_args.py \
       /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py \
@@ -62,4 +64,5 @@ RUN python3 /tmp/patch_pp_spec_guard.py \
       /tmp/patch_mtp_pp_pool_profile.py \
       /tmp/patch_mtp_pp_local_memory_budget.py \
       /tmp/patch_mtp_pp_embed_fp8.py \
-      /tmp/patch_nvfp4_sequential_dequant.py
+      /tmp/patch_nvfp4_sequential_dequant.py \
+      /tmp/patch_mtp_pp_quiet_logs.py
